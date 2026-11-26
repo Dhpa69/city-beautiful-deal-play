@@ -795,7 +795,7 @@ const NET = {
       if (this.mode === 'host' && this.room) this.room.seats.forEach(s => { if (s.conn) { if (s.conn.open) s.conn.send({ t: 'ping' }); if (Date.now() - (s.lastSeen || 0) > 25000) { const c = s.conn; c.close(); this.dropConn(c); } } });
       if (this.mode === 'client') {
         if (this.conn && this.conn.open) this.conn.send({ t: 'pong', ver: this.ver, hs: this.hs });
-        if (this.conn && this.conn.open && Date.now() - this.lastHost > 14000) { this.conn.open = false; this.status('Lost contact with the host - reconnecting…', ''); if (S) toast('Reconnecting to host…'); this.knock(); }
+        if (this.conn && this.conn.open && Date.now() - this.lastHost > 20000) { this.conn.open = false; this.status('Lost contact with the host - reconnecting…', ''); if (S) toast('Reconnecting to host…'); this.knock(); }
         if (this.pendingAct && Date.now() - this.pendingAct.at > 5000 && this.conn && this.conn.open) { this.pendingAct.at = Date.now(); this.conn.send(this.pendingAct.msg); }
       }
     }, 3000);
@@ -845,7 +845,7 @@ const NET = {
       if (this.everJoined) this.status('Reconnected.', 'good');
       return;
     }
-    if (!this.conn.open) { this.conn.open = true; this.conn.broker = bi; }
+    if (!this.conn.open) { this.conn.open = true; this.conn.broker = bi; clearTimeout(this._knock); if (this.everJoined) this.status(S ? 'Connected.' : 'Joined! Waiting for the host to start.', 'good'); }
     this.onClientMsg(msg);
   },
   onClientMsg(msg) {
