@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0f3b3a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>City Beautiful Deal</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="setup" class="screen">
+  <div class="setup-card">
+    <div class="logo"><span class="sun"></span><h1>City Beautiful Deal</h1><p>Collect three complete Orlando-area sets to win.</p></div>
+    <div class="row"><label>Players</label><div class="seg" id="countSeg"><button data-n="2">2</button><button data-n="3">3</button><button data-n="4" class="on">4</button></div></div>
+    <div class="row"><label>Mode</label><div class="seg" id="modeSeg"><button data-m="ai" class="on">Me vs computer</button><button data-m="pp">Pass &amp; play</button></div></div>
+    <div id="seats"></div>
+    <button id="startBtn" class="primary big">Start game</button>
+    <button id="resumeBtn" class="ghost big hidden">Continue saved game</button>
+    <div class="sec" style="margin-top:16px">Online - play on separate phones</div>
+    <button id="hostBtn" class="big">📡 Host online game</button>
+    <button id="joinBtn" class="big">🔑 Join online game</button>
+    <button id="rejoinBtn" class="ghost big hidden">Rejoin</button>
+    <button id="helpBtn0" class="ghost big">How to play &amp; all cards</button>
+  </div>
+</div>
+
+<div id="lobby" class="screen hidden">
+  <div class="setup-card">
+    <div class="logo"><span class="sun"></span><h1>Online room</h1></div>
+    <p class="center muted">Room code</p><div id="lobbyCode" class="roomcode">…</div>
+    <button id="lobbyInvite" class="primary big">📨 Send invite</button>
+    <div class="row" id="lobbyCount"><label>Players</label><div class="seg"><button data-n="2">2</button><button data-n="3">3</button><button data-n="4">4</button></div></div>
+    <div id="lobbySeats"></div>
+    <p id="lobbyStatus" class="center muted"></p>
+    <button id="lobbyStart" class="primary big">Start game</button>
+    <p id="lobbyWait" class="center muted">The host starts the game when everyone is in.</p>
+    <button id="lobbyLeave" class="ghost big">Leave room</button>
+  </div>
+</div>
+
+<div id="game" class="screen hidden">
+  <header>
+    <div class="title">City Beautiful Deal</div>
+    <div id="turnInfo"></div>
+    <div class="hbtns"><button id="logBtn" class="icon" title="Game log">Log</button><button id="helpBtn" class="icon" title="Rules">?</button><button id="menuBtn" class="icon" title="Menu">☰</button></div>
+  </header>
+  <div id="opps"></div>
+  <div id="me"></div>
+  <div id="handWrap">
+    <div id="handBar"><span id="handTitle"></span><span id="playsLeft"></span><button id="endBtn" class="primary">End turn</button></div>
+    <div id="hand"></div>
+  </div>
+  <div id="toast" class="hidden"></div>
+</div>
+
+<div id="logPanel" class="drawer hidden"><div class="drawer-head"><b>Game log</b><button class="icon" data-close="logPanel">✕</button></div><div id="logList"></div></div>
+<div id="helpPanel" class="drawer wide hidden"><div class="drawer-head"><b>How to play</b><button class="icon" data-close="helpPanel">✕</button></div><div id="helpBody"></div></div>
+<div id="modal" class="overlay hidden"><div class="sheet" id="sheet"></div></div>
+<div id="pass" class="overlay solid hidden"><div class="pass-box"><div class="sun"></div><h2 id="passTitle"></h2><p id="passMsg"></p><button id="passBtn" class="primary big"></button></div></div>
+
+<script src="vendor/peerjs.min.js"></script>
+<script src="engine.js"></script>
+<script src="ai.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
