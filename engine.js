@@ -44,13 +44,14 @@ function buildDeck() {
 function rand(s) { let t = s.rs = (s.rs + 0x6D2B79F5) | 0; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }
 function shuffle(s, a) { for (let i=a.length-1;i>0;i--) { const j = Math.floor(rand(s)*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
 
+function ev(s, e) { s.evSeq = (s.evSeq || 0) + 1; e.seq = s.evSeq; (s.events || (s.events = [])).push(e); if (s.events.length > 80) s.events.shift(); }
 function log(s, msg) { s.log.push(msg); if (s.log.length > 400) s.log.shift(); }
 const C = (s, id) => s.cards[id];
 const P = (s, i) => s.players[i];
 
 function newGame(opts) {
   const cards = buildDeck();
-  const s = { cards, deck: [], discard: [], players: [], cur: 0, plays: 0, phase: 'play', pending: null, winner: null, log: [], pileSeq: 1, turn: 0, rs: (opts.seed == null ? (Date.now() ^ (Math.random()*1e9)) : opts.seed) | 0, maxTurns: opts.maxTurns || 2000 };
+  const s = { events: [], evSeq: 0, cards, deck: [], discard: [], players: [], cur: 0, plays: 0, phase: 'play', pending: null, winner: null, log: [], pileSeq: 1, turn: 0, rs: (opts.seed == null ? (Date.now() ^ (Math.random()*1e9)) : opts.seed) | 0, maxTurns: opts.maxTurns || 2000 };
   s.players = opts.players.map((p, i) => ({ id: i, name: p.name || ('Player ' + (i+1)), ai: !!p.ai, hand: [], bank: [], piles: [] }));
   if (opts.teams) {
     const tm = opts.teams.slice(0, s.players.length);
@@ -81,6 +82,7 @@ function startTurn(s) {
   if (s.turn > s.maxTurns) { s.winner = -1; s.phase = 'over'; log(s, 'Turn limit reached: game drawn.'); return; }
   const n = draw(s, p, p.hand.length === 0 ? 5 : 2);
   s.plays = 0; s.phase = 'play';
+  ev(s, { k: 'turn', p: s.cur, n });
   log(s, p.name + "'s turn (drew " + n + ').');
 }
 
@@ -153,12 +155,12 @@ function checkWin(s) {
   if (s.winner != null) return;
   if (s.teams) {
     const order = s.players.map((_, i) => (s.cur + i) % s.players.length);
-    for (const i of order) if (teamColors(s, s.teams[i]).size >= 5) { s.winner = i; s.winnerTeam = s.teams[i]; s.phase = 'over'; s.pending = null;
+    for (const i of order) if (teamColors(s, s.teams[i]).size >= 5) { s.winner = i; s.winnerTeam = s.teams[i]; s.phase = 'over'; s.pending = null; ev(s, { k: 'win', p: i, team: s.teams[i] });
       log(s, TEAM_NAMES[s.teams[i]] + ' (' + s.players.filter(p => p.team === s.teams[i]).map(p => p.name).join(' & ') + ') wins with 5 complete sets!'); return; }
     return;
   }
   const order = s.players.map((_, i) => (s.cur + i) % s.players.length);
-  for (const i of order) if (completeColors(s, P(s, i)).size >= 3) { s.winner = i; s.phase = 'over'; s.pending = null; log(s, P(s, i).name + ' wins with 3 complete sets!'); return; }
+  for (const i of order) if (completeColors(s, P(s, i)).size >= 3) { s.winner = i; s.phase = 'over'; s.pending = null; ev(s, { k: 'win', p: i }); log(s, P(s, i).name + ' wins with 3 complete sets!'); return; }
 }
 
 // ---------- whose decision ----------
@@ -244,6 +246,7 @@ function apply(s, a) {
     const need = p.hand.length - 7;
     if (!Array.isArray(a.cards) || a.cards.length !== need || new Set(a.cards).size !== need || !a.cards.every(id => p.hand.includes(id))) throw new Error('discard exactly ' + need);
     a.cards.forEach(id => { fromHand(s, p, id); s.discard.push(id); });
+    ev(s, { k: 'discard', p: s.cur, n: need });
     log(s, p.name + ' discarded ' + need + '.');
     return nextTurn(s);
   }
@@ -255,27 +258,28 @@ function apply(s, a) {
     if (p.hand.length > 7) { s.phase = 'discard'; return; }
     return nextTurn(s);
   }
-  if (a.t === 'move') { const col = removeCardFromPiles(s, p, a.card); addProp(s, p, a.card, a.color); log(s, p.name + ' flipped ' + C(s, a.card).name + ' from ' + SETS[col].label + ' to ' + SETS[a.color].label + '.'); return checkWin(s); }
+  if (a.t === 'move') { const col = removeCardFromPiles(s, p, a.card); addProp(s, p, a.card, a.color); ev(s, { k: 'flip', p: s.cur, card: a.card, from: col, color: a.color }); log(s, p.name + ' flipped ' + C(s, a.card).name + ' from ' + SETS[col].label + ' to ' + SETS[a.color].label + '.'); return checkWin(s); }
   const c = C(s, a.card);
   fromHand(s, p, a.card);
   s.plays++;
   switch (a.t) {
-    case 'bank': p.bank.push(a.card); log(s, p.name + ' banked ' + c.name + ' (' + c.value + 'M).'); break;
-    case 'prop': addProp(s, p, a.card, a.color); log(s, p.name + ' played ' + c.name + (c.kind === 'wild' ? ' as ' + SETS[a.color].label : '') + '.'); checkWin(s); break;
-    case 'passgo': s.discard.push(a.card); draw(s, p, 2); log(s, p.name + ' played Pass Go and drew 2.'); break;
-    case 'house': case 'hotel': { const pl = p.piles.find(x => x.id === a.pile); pl[a.t] = a.card; log(s, p.name + ' built a ' + c.name + ' on ' + SETS[pl.color].label + '.'); checkWin(s); break; }
+    case 'bank': p.bank.push(a.card); ev(s, { k: 'bank', p: s.cur, card: a.card }); log(s, p.name + ' banked ' + c.name + ' (' + c.value + 'M).'); break;
+    case 'prop': ev(s, { k: 'prop', p: s.cur, card: a.card, color: a.color }); addProp(s, p, a.card, a.color); log(s, p.name + ' played ' + c.name + (c.kind === 'wild' ? ' as ' + SETS[a.color].label : '') + '.'); checkWin(s); break;
+    case 'passgo': s.discard.push(a.card); ev(s, { k: 'passgo', p: s.cur, card: a.card, n: draw(s, p, 2) }); log(s, p.name + ' played Pass Go and drew 2.'); break;
+    case 'house': case 'hotel': { const pl = p.piles.find(x => x.id === a.pile); pl[a.t] = a.card; ev(s, { k: 'build', p: s.cur, card: a.card, color: pl.color }); log(s, p.name + ' built a ' + c.name + ' on ' + SETS[pl.color].label + '.'); checkWin(s); break; }
     case 'rent': {
       s.discard.push(a.card);
       const ds = []; (a.doubles || []).forEach(() => { const d = p.hand.find(id => C(s, id).act === 'double'); fromHand(s, p, d); s.discard.push(d); ds.push(d); s.plays++; });
       const amount = rentFor(s, p, a.color) * Math.pow(2, ds.length);
       const targets = a.target === 'all' ? opponents(s) : [a.target];
+      ev(s, { k: 'rent', p: s.cur, card: a.card, color: a.color, amount, targets, doubles: ds.length });
       log(s, p.name + ' charged ' + SETS[a.color].label + ' rent: ' + amount + 'M' + (ds.length ? ' (doubled' + (ds.length > 1 ? ' twice' : '') + ')' : '') + ' from ' + (a.target === 'all' ? 'everyone' : P(s, a.target).name) + '.');
-      beginEffect(s, { kind: 'pay', label: SETS[a.color].label + ' rent', amount, targets, rent: true }); break; }
-    case 'birthday': s.discard.push(a.card); log(s, p.name + " played It's My Birthday: 2M from everyone."); beginEffect(s, { kind: 'pay', label: "It's My Birthday", amount: 2, targets: opponents(s) }); break;
-    case 'debt': s.discard.push(a.card); log(s, p.name + ' played Debt Collector on ' + P(s, a.target).name + ' (5M).'); beginEffect(s, { kind: 'pay', label: 'Debt Collector', amount: 5, targets: [a.target] }); break;
-    case 'sly': s.discard.push(a.card); log(s, p.name + ' played Sly Deal on ' + P(s, a.target).name + "'s " + C(s, a.take).name + '.'); beginEffect(s, { kind: 'sly', label: 'Sly Deal', targets: [a.target], take: a.take }); break;
-    case 'forced': s.discard.push(a.card); log(s, p.name + ' played Forced Deal: ' + C(s, a.give).name + ' for ' + P(s, a.target).name + "'s " + C(s, a.take).name + '.'); beginEffect(s, { kind: 'forced', label: 'Forced Deal', targets: [a.target], take: a.take, give: a.give }); break;
-    case 'dealbreaker': { s.discard.push(a.card); const pl = P(s, a.target).piles.find(x => x.id === a.pile); log(s, p.name + ' played Deal Breaker on ' + P(s, a.target).name + "'s " + SETS[pl.color].label + ' set.'); beginEffect(s, { kind: 'dealbreaker', label: 'Deal Breaker', targets: [a.target], pile: a.pile }); break; }
+      beginEffect(s, { card: a.card, kind: 'pay', label: SETS[a.color].label + ' rent', amount, targets, rent: true }); break; }
+    case 'birthday': s.discard.push(a.card); ev(s, { k: 'action', p: s.cur, card: a.card, act: 'birthday', targets: opponents(s) }); log(s, p.name + " played It's My Birthday: 2M from everyone."); beginEffect(s, { card: a.card, kind: 'pay', label: "It's My Birthday", amount: 2, targets: opponents(s) }); break;
+    case 'debt': s.discard.push(a.card); ev(s, { k: 'action', p: s.cur, card: a.card, act: 'debt', targets: [a.target] }); log(s, p.name + ' played Debt Collector on ' + P(s, a.target).name + ' (5M).'); beginEffect(s, { card: a.card, kind: 'pay', label: 'Debt Collector', amount: 5, targets: [a.target] }); break;
+    case 'sly': s.discard.push(a.card); ev(s, { k: 'action', p: s.cur, card: a.card, act: 'sly', targets: [a.target], take: a.take }); log(s, p.name + ' played Sly Deal on ' + P(s, a.target).name + "'s " + C(s, a.take).name + '.'); beginEffect(s, { card: a.card, kind: 'sly', label: 'Sly Deal', targets: [a.target], take: a.take }); break;
+    case 'forced': s.discard.push(a.card); ev(s, { k: 'action', p: s.cur, card: a.card, act: 'forced', targets: [a.target], take: a.take, give: a.give }); log(s, p.name + ' played Forced Deal: ' + C(s, a.give).name + ' for ' + P(s, a.target).name + "'s " + C(s, a.take).name + '.'); beginEffect(s, { card: a.card, kind: 'forced', label: 'Forced Deal', targets: [a.target], take: a.take, give: a.give }); break;
+    case 'dealbreaker': { s.discard.push(a.card); const pl = P(s, a.target).piles.find(x => x.id === a.pile); ev(s, { k: 'action', p: s.cur, card: a.card, act: 'dealbreaker', targets: [a.target], color: pl.color, cards: pl.cards.slice() }); log(s, p.name + ' played Deal Breaker on ' + P(s, a.target).name + "'s " + SETS[pl.color].label + ' set.'); beginEffect(s, { card: a.card, kind: 'dealbreaker', label: 'Deal Breaker', targets: [a.target], pile: a.pile }); break; }
     default: throw new Error('unknown action');
   }
 }
@@ -304,7 +308,7 @@ function advance(s) {
       if (who != null) { pd.responder = who; return; }
       pd.stage = pd.chain % 2 ? 'skip' : 'apply';
     }
-    if (pd.stage === 'skip') { log(s, pd.label + ' against ' + P(s, pd.target).name + ' was cancelled.'); pd.stage = 'next'; continue; }
+    if (pd.stage === 'skip') { ev(s, { k: 'cancel', p: pd.from, target: pd.target, label: pd.label }); log(s, pd.label + ' against ' + P(s, pd.target).name + ' was cancelled.'); pd.stage = 'next'; continue; }
     if (pd.stage === 'apply') { if (applyEffect(s, pd)) return; pd.stage = 'next'; if (s.winner != null) { s.pending = null; return; } }
   }
 }
@@ -312,16 +316,17 @@ function applyEffect(s, pd) {
   const from = P(s, pd.from), tg = P(s, pd.target);
   if (pd.kind === 'pay') {
     const assets = payable(s, tg); const total = sumVal(s, assets);
-    if (total === 0) { log(s, tg.name + ' has nothing to pay with.'); return false; }
-    if (total <= pd.amount) { transfer(s, tg, from, assets); log(s, tg.name + ' paid everything they had (' + total + 'M) to ' + from.name + '.'); return false; }
+    if (total === 0) { ev(s, { k: 'pay', from: pd.target, to: pd.from, cards: [], total: 0 }); log(s, tg.name + ' has nothing to pay with.'); return false; }
+    if (total <= pd.amount) { ev(s, { k: 'pay', from: pd.target, to: pd.from, cards: assets.slice(), total, all: true }); transfer(s, tg, from, assets); log(s, tg.name + ' paid everything they had (' + total + 'M) to ' + from.name + '.'); return false; }
     pd.stage = 'pay'; return true;
   }
   if (pd.kind === 'sly' || pd.kind === 'forced') {
+    ev(s, { k: 'take', from: pd.target, to: pd.from, card: pd.take, give: pd.kind === 'forced' ? pd.give : null });
     const col = removeCardFromPiles(s, tg, pd.take); addProp(s, from, pd.take, col);
     if (pd.kind === 'forced') { const col2 = removeCardFromPiles(s, from, pd.give); addProp(s, tg, pd.give, col2); }
     log(s, from.name + ' took ' + C(s, pd.take).name + (pd.kind === 'forced' ? ' and gave ' + C(s, pd.give).name : '') + '.');
   } else if (pd.kind === 'dealbreaker') {
-    const pl = tg.piles.find(x => x.id === pd.pile); tg.piles.splice(tg.piles.indexOf(pl), 1); from.piles.push(pl); normalize(s, from); normalize(s, tg);
+    const pl = tg.piles.find(x => x.id === pd.pile); ev(s, { k: 'stealset', from: pd.target, to: pd.from, color: pl.color, cards: pl.cards.concat([pl.house, pl.hotel].filter(x => x != null)) }); tg.piles.splice(tg.piles.indexOf(pl), 1); from.piles.push(pl); normalize(s, from); normalize(s, tg);
     log(s, from.name + ' took the complete ' + SETS[pl.color].label + ' set.');
   }
   checkWin(s); return false;
@@ -343,6 +348,7 @@ function applyPending(s, a) {
     const n = a.n | 0, r = P(s, pd.responder);
     if (n < 0 || n > countDoubles(s, pd.responder)) throw new Error('not enough Double The Rent cards');
     for (let k = 0; k < n; k++) { const d = r.hand.find(id => C(s, id).act === 'double'); fromHand(s, r, d); s.discard.push(d); pd.amount *= 2; }
+    if (n) ev(s, { k: 'boost', p: pd.responder, n, amount: pd.amount, from: pd.from });
     if (n) log(s, r.name + ' stacked ' + n + ' Double The Rent on ' + P(s, pd.from).name + "'s rent: now " + pd.amount + 'M.');
     pd.declined.push(pd.responder);
     return advance(s);
@@ -351,7 +357,7 @@ function applyPending(s, a) {
     if (a.t !== 'jsn') throw new Error('expected Just Say No decision');
     if (a.use) {
       const r = P(s, pd.responder); const j = r.hand.find(id => C(s, id).act === 'jsn'); if (j == null) throw new Error('no Just Say No');
-      fromHand(s, r, j); s.discard.push(j); pd.chain++; pd.declined = [];
+      fromHand(s, r, j); s.discard.push(j); pd.chain++; pd.declined = []; ev(s, { k: 'jsn', p: pd.responder, card: j, against: pd.chain % 2 ? pd.from : pd.target, label: pd.label });
       log(s, r.name + ' played Just Say No' + (pd.responder !== pd.target && pd.responder !== pd.from ? ' for their teammate' : '') + '!');
     } else pd.declined.push(pd.responder);
     return advance(s);
@@ -363,6 +369,7 @@ function applyPending(s, a) {
     if (!ids.every(id => assets.includes(id))) throw new Error('invalid payment card');
     const v = sumVal(s, ids);
     if (v < pd.amount && ids.length !== assets.length) throw new Error('payment too small');
+    ev(s, { k: 'pay', from: pd.target, to: pd.from, cards: ids.slice(), total: v });
     transfer(s, tg, P(s, pd.from), ids);
     log(s, tg.name + ' paid ' + v + 'M to ' + P(s, pd.from).name + '.');
     pd.stage = 'next'; checkWin(s); if (s.winner != null) { s.pending = null; return; }

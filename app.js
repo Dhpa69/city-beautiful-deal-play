@@ -52,258 +52,468 @@ function startGame() {
   viewer = players.findIndex(p => !p.ai);
   showGame();
 }
-function showGame() { $('setup').classList.add('hidden'); $('game').classList.remove('hidden'); passedTo = humans().length > 1 ? null : viewer; loop(); }
+function showGame() { skipAll = false; lastSeq = (S && S.evSeq) ? Math.max(0, S.evSeq - (S.turn <= 1 ? 1 : 0)) : 0; $('setup').classList.add('hidden'); $('game').classList.remove('hidden'); passedTo = humans().length > 1 ? null : viewer; loop(); }
 const humans = () => S.players.filter(p => !p.ai && !p.remote).map(p => p.id);
 function save() { if (NET.mode === 'client') return; try { if (S.winner == null) localStorage.setItem(SAVE, JSON.stringify({ S, viewer, room: NET.mode === 'host' ? NET.roomSave() : null })); else localStorage.removeItem(SAVE); } catch (e) {} }
 
-// ---------- main loop ----------
+// ---------- main loop with paced playback ----------
 let passedTo = null;
+const SPEEDS = { slow: 1800, normal: 1250, fast: 650, instant: 0 };
+const THINK = { slow: 700, normal: 450, fast: 200, instant: 0 };
+let speed = localStorage.getItem('cbd-speed') || 'normal'; if (!(speed in SPEEDS)) speed = 'normal';
+let lastSeq = 0, playing = false, loopAgain = false, shown = null, skipAll = false, skipStep = null;
+function snapshot() { const c = S.cards; delete S.cards; const x = JSON.parse(JSON.stringify(S)); S.cards = c; x.cards = c; return x; }
+function newEvents() { return (S.events || []).filter(e => e.seq > lastSeq); }
 function loop() {
-  clearTimeout(aiTimer); closeModal();
-  save(); render();
+  clearTimeout(aiTimer);
+  if (!S) return;
+  if (playing) { loopAgain = true; return; }
+  save();
   if (NET.mode === 'host') NET.broadcastState();
+  const evs = newEvents();
+  if (evs.length && SPEEDS[speed] > 0) {
+    closeModal(); playing = true; lastSeq = evs[evs.length - 1].seq;
+    render();
+    playEvents(evs).then(() => { playing = false; shown = null; loopAgain = false; loop(); });
+    return;
+  }
+  lastSeq = S.evSeq || 0; shown = null;
+  closeModal(); render();
   if (S.winner != null) return showWinner();
   const who = E.actorNow(S);
-  if (NET.mode === 'client') { $('pass').classList.add('hidden'); if (who !== viewer) return; if (S.pending) return S.pending.stage === 'jsn' ? promptJSN() : S.pending.stage === 'boost' ? promptBoost() : promptPay(); if (S.phase === 'discard') return promptDiscard(); return; }
+  if (NET.mode === 'client') { $('pass').classList.add('hidden'); if (who !== viewer) return; return humanPrompt(); }
   const pl = S.players[who];
   if (pl.remote && !pl.ai) {
-    if (!pl.away) return; // waiting for that phone
+    if (!pl.away) return;
     const left = NET.grace - (Date.now() - pl.away);
     aiTimer = setTimeout(() => { if (E.actorNow(S) === who && S.players[who].away) act(AI.choose(S)); else loop(); }, Math.max(left, AI_DELAY)); return;
   }
-  if (pl.ai) { aiTimer = setTimeout(() => { act(AI.choose(S)); }, S.pending ? AI_DELAY * 0.8 : AI_DELAY); return; }
+  if (pl.ai) { aiTimer = setTimeout(() => act(AI.choose(S)), speed === 'instant' ? AI_DELAY : THINK[speed]); return; }
   if (humans().length > 1 && passedTo !== who) return showPass(who);
   viewer = who; $('pass').classList.add('hidden'); render();
+  humanPrompt();
+  if (!S.pending && S.phase === 'play') maybeTips();
+}
+function humanPrompt() {
   if (S.pending) return S.pending.stage === 'jsn' ? promptJSN() : S.pending.stage === 'boost' ? promptBoost() : promptPay();
   if (S.phase === 'discard') return promptDiscard();
 }
 function act(a) {
   if (NET.mode === 'client') { closeModal(); NET.send({ t: 'act', a }); $('playsLeft').textContent = 'Sending…'; return; }
-  try { E.apply(S, a); } catch (e) { toast(e.message); console.error(e); }
+  if (!playing) shown = snapshot();
+  try { E.apply(S, a); } catch (e) { shown = null; toast(e.message); console.error(e); }
   loop();
 }
 function showPass(who) {
   const p = S.players[who];
   $('passTitle').textContent = 'Pass to ' + p.name;
-  $('passMsg').textContent = S.pending ? (S.pending.stage === 'jsn' ? p.name + ' needs to decide on a Just Say No.' : p.name + ' needs to pay.') : (who === S.cur ? "It's " + p.name + "'s turn." : '');
+  $('passMsg').textContent = S.pending ? (S.pending.stage === 'jsn' ? p.name + ' needs to decide on a Just Say No.' : S.pending.stage === 'boost' ? p.name + ' can stack Double The Rent.' : p.name + ' needs to pay.') : (who === S.cur ? "It's " + p.name + "'s turn." : '');
   $('passBtn').textContent = "I'm " + p.name + ' - show my hand';
   $('pass').classList.remove('hidden');
   $('passBtn').onclick = () => { passedTo = who; viewer = who; loop(); };
 }
 
-// ---------- rendering ----------
+// ---------- names & wording ----------
+const youMode = () => NET.mode !== 'local' || (S && humans().length <= 1);
+const N = pid => (youMode() && pid === viewer) ? 'You' : esc(S.players[pid].name);
+const POS = pid => (youMode() && pid === viewer) ? 'your' : esc(S.players[pid].name) + "'s";
+const VB = (pid, a, b) => (youMode() && pid === viewer) ? a : b;
+const cname = id => { const c = S.cards[id]; return c.kind === 'wild' ? (c.any ? 'Any-Set Wild' : 'Wild') : c.name; };
+const AVATAR = ['#ff9f1c', '#4ea8ff', '#e65ea8', '#2fa65a'];
+function avatar(p) { return `<span class="avatar" style="background:${S.teams ? TEAM_HEX[p.team] : AVATAR[p.id % 4]}">${esc((p.name || '?')[0].toUpperCase())}</span>`; }
+function progressText(p) { return S.teams ? E.teamColors(S, p.team).size + '/5' : E.completeColors(S, p).size + '/3'; }
+
+// ---------- cards ----------
+const ICON = { dealbreaker: '💥', jsn: '✋', sly: '🦊', forced: '🔄', debt: '💼', birthday: '🎂', passgo: '🚦', house: '🏠', hotel: '🏨', double: '✖️2' };
+const SHORT = { dealbreaker: 'Steal a complete set', jsn: 'Cancel an action against you', sly: 'Steal 1 property (not from a full set)', forced: 'Swap 1 property (not from a full set)', debt: 'One player pays you 5M', birthday: 'Everyone pays you 2M', passgo: 'Draw 2 extra cards', house: '+3M rent on a full set', hotel: '+4M rent (set needs a House)', double: 'Play with Rent: x2' };
 function sw(color) { return `<span class="sw" style="background:${SETS[color].hex}"></span>`; }
-function band(c) {
-  if (c.kind === 'prop') return `<div class="band" style="background:${SETS[c.color].hex};color:${SETS[c.color].text}">${esc(SETS[c.color].label)}</div>`;
-  if (c.kind === 'wild' || c.kind === 'rent') {
-    const lbl = c.kind === 'rent' ? 'Rent' : 'Wild';
-    if (c.any) return `<div class="band rainbow" style="color:#fff;text-shadow:0 1px 2px #000">${lbl} · any</div>`;
-    const [a, b] = c.colors; return `<div class="band" style="background:linear-gradient(90deg,${SETS[a].hex} 50%,${SETS[b].hex} 50%);color:#fff;text-shadow:0 1px 2px #000">${lbl}</div>`;
-  }
-  if (c.kind === 'money') return `<div class="band" style="background:#5e9e3a;color:#fff">Money</div>`;
-  return `<div class="band" style="background:#ffd166;color:#4a3000">Action</div>`;
-}
-function cardText(c) {
-  if (c.kind === 'prop') return 'Rent ' + SETS[c.color].rent.join(' · ') + 'M<br>' + SETS[c.color].size + ' for a set';
-  if (c.kind === 'wild') return c.any ? 'Use as any color. No money value.' : SETS[c.colors[0]].label + ' or ' + SETS[c.colors[1]].label;
-  if (c.kind === 'rent') return c.any ? 'Charge one player rent for any of your sets.' : 'All players pay rent for ' + SETS[c.colors[0]].label + ' or ' + SETS[c.colors[1]].label + '.';
-  if (c.kind === 'action') return E.ACTIONS[c.act].text;
-  return '';
-}
 function cardHTML(id, cls) {
+  cls = cls || '';
+  if (id === 'back' || id == null || id < 0) return `<div class="card back ${cls}"><div class="backart"><span class="sun"></span><b>City<br>Beautiful</b></div></div>`;
   const c = S.cards[id];
-  return `<div class="card ${c.kind} ${cls || ''}" data-id="${id}">${band(c)}<div class="nm">${esc(c.kind === 'wild' ? (c.any ? 'Any-Set Wild' : 'Property Wild') : c.name)}</div><div class="tx">${cardText(c)}</div>${c.kind === 'money' ? '' : `<div class="val">${c.value}M</div>`}</div>`;
-}
-function miniHTML(id, color, extraCls) {
-  const c = S.cards[id];
-  const nm = c.kind === 'wild' ? (c.any ? 'Any-Set Wild' : 'Wild') : c.name;
-  return `<div class="mini ${extraCls || ''}" data-id="${id}">${color ? sw(color) : ''}<span>${esc(nm)}</span><b style="margin-left:auto">${c.value}M</b></div>`;
+  if (c.kind === 'prop') { const st = SETS[c.color];
+    return `<div class="card prop ${cls}" data-id="${id}" style="--c:${st.hex};--t:${st.text}"><div class="cbar">${esc(st.label)}</div><div class="cname">${esc(c.name)}</div><div class="ladder">${st.rent.map((r, i) => `<div class="${i === st.rent.length - 1 ? 'full' : ''}"><span>${i === st.rent.length - 1 ? '★ full set' : (i + 1) + ' card' + (i ? 's' : '')}</span><b>${r}M</b></div>`).join('')}</div><div class="cval">${c.value}M</div></div>`; }
+  if (c.kind === 'wild') {
+    if (c.any) return `<div class="card wild anyw ${cls}" data-id="${id}"><div class="cbar rainbow">Wild · any set</div><div class="cname">Any-Set Wild</div><div class="ctext">Counts as any color. No money value - can't pay debts.</div></div>`;
+    const [a, b] = c.colors, A = SETS[a], B = SETS[b];
+    return `<div class="card wild ${cls}" data-id="${id}"><div class="cbar split" style="background:linear-gradient(90deg,${A.hex} 50%,${B.hex} 50%)"><span style="color:${A.text}">${esc(A.label)}</span><span style="color:${B.text}">${esc(B.label)}</span></div><div class="cname">Property Wild</div><div class="wrent"><div>${sw(a)}${A.rent.join('·')}M</div><div>${sw(b)}${B.rent.join('·')}M</div></div><div class="cval">${c.value}M</div></div>`; }
+  if (c.kind === 'money') return `<div class="card money m${c.value} ${cls}" data-id="${id}"><div class="mcorner">${c.value}M</div><div class="mbig">${c.value}M</div><div class="mcap">Money</div></div>`;
+  if (c.kind === 'rent') {
+    const disc = c.any ? 'conic-gradient(#8a5a32,#8fd3f4,#e65ea8,#f59331,#e23b3b,#f6d533,#2fa65a,#2446a8,#8a5a32)' : `conic-gradient(${SETS[c.colors[0]].hex} 0 50%,${SETS[c.colors[1]].hex} 50% 100%)`;
+    return `<div class="card rent ${cls}" data-id="${id}"><div class="rdisc" style="background:${disc}"><b>RENT</b></div><div class="aname">${c.any ? 'Wild Rent' : esc(SETS[c.colors[0]].label + ' / ' + SETS[c.colors[1]].label)}</div><div class="ctext">${c.any ? 'One player pays rent for any of your sets' : 'Every opponent pays'}</div><div class="cval">${c.value}M</div></div>`; }
+  return `<div class="card action a-${c.act} ${cls}" data-id="${id}"><div class="aicon">${ICON[c.act]}</div><div class="aname">${esc(c.name)}</div><div class="ctext">${SHORT[c.act]}</div><div class="cval">${c.value}M</div></div>`;
 }
 function pileHTML(pl, mine) {
   const done = E.pileComplete(S, pl), st = SETS[pl.color];
-  const canFlip = mine && S.cur === viewer && !S.pending && S.phase === 'play';
-  let h = `<div class="pile ${done ? 'done' : ''}"><div class="ph">${sw(pl.color)}<span>${esc(st.label)}</span><span>${Math.min(pl.cards.length, st.size)}/${st.size}${done ? ' ✓' : ''}</span></div>`;
-  pl.cards.forEach(id => { const w = S.cards[id].kind === 'wild'; h += miniHTML(id, pl.color, w && canFlip ? 'tap flip' : ''); });
-  if (pl.house != null) h += `<div class="mini" data-id="${pl.house}">🏠 House <b style="margin-left:auto">3M</b></div>`;
-  if (pl.hotel != null) h += `<div class="mini" data-id="${pl.hotel}">🏨 Hotel <b style="margin-left:auto">4M</b></div>`;
-  return h + `<div style="font-size:11px;color:var(--muted)">Rent now: ${E.rentFor(S, { piles: [pl] }, pl.color)}M</div></div>`;
+  const canFlip = mine && S.cur === viewer && !S.pending && S.phase === 'play' && !playing && NET.mode !== 'client' || (mine && NET.mode === 'client' && S.cur === viewer && !S.pending && S.phase === 'play');
+  let cards = pl.cards.map(id => cardHTML(id, 'xs' + (S.cards[id].kind === 'wild' && canFlip ? ' flip' : ''))).join('');
+  if (pl.house != null) cards += cardHTML(pl.house, 'xs'); if (pl.hotel != null) cards += cardHTML(pl.hotel, 'xs');
+  return `<div class="fan ${done ? 'done' : ''}" style="--c:${st.hex}"><div class="fanhead">${sw(pl.color)}<b>${esc(st.label)}</b><span>${Math.min(pl.cards.length, st.size)}/${st.size}${done ? ' ✓' : ''}</span><span class="rentnow">rent ${E.rentFor(S, { piles: [pl] }, pl.color)}M</span></div><div class="fancards">${cards}</div></div>`;
 }
+function setBar(pl) {
+  const st = SETS[pl.color], n = Math.min(pl.cards.length, st.size), done = E.pileComplete(S, pl);
+  return `<span class="setbar ${done ? 'done' : ''}" style="--c:${st.hex};--t:${st.text}" title="${esc(pl.cards.map(cname).join(', '))}"><span class="fill" style="width:${n / st.size * 100}%"></span><span class="lbl">${esc(st.label)} ${n}/${st.size}${pl.house != null ? ' 🏠' : ''}${pl.hotel != null ? '🏨' : ''}${done ? ' ✓' : ''}</span></span>`;
+}
+
+// ---------- rendering ----------
 function render() {
   if (!S) return;
-  const cur = S.players[S.cur];
-  $('turnInfo').textContent = S.winner != null ? 'Game over' : `Turn ${S.turn}: ${cur.name}` + (S.pending ? ` · ${S.pending.label}` : '');
+  const real = S; if (shown) S = shown;
+  try { renderBody(); } finally { S = real; }
+}
+function renderBody() {
+  const cur = S.players[S.cur], me = S.players[viewer];
+  const myTurn = S.winner == null && viewer === S.cur && !S.pending && S.phase === 'play' && !playing;
+  // header pill
+  let pill;
+  if (S.winner != null) pill = 'Game over';
+  else if (S.pending) { const a = E.actorNow(S); pill = `${avatar(S.players[a])}<span>${a === viewer && youMode() ? 'Your decision' : 'Waiting for ' + esc(S.players[a].name)}</span>`; }
+  else pill = `${avatar(cur)}<span>${S.cur === viewer && youMode() ? 'Your turn' : esc(cur.name) + "'s turn"}</span>`;
+  $('turnPill').innerHTML = pill; $('turnPill').classList.toggle('mine', S.cur === viewer && S.winner == null);
+  $('speedBtn').textContent = { slow: '🐢 Slow', normal: '▶ Normal', fast: '⏩ Fast', instant: '⚡' }[speed];
+  // feed
+  const recent = (S.events || []).filter(e => e.k !== 'win').slice(-4).reverse();
+  $('feed').innerHTML = recent.map((e, i) => { const v = eventView(e); return `<span class="chip ${i === 0 ? 'new' : ''} tone-${v.tone || ''}">${v.icon || ''} ${v.cap}</span>`; }).join('') || '<span class="chip">Moves will show here</span>';
   // opponents
+  $('opps').className = 'n' + (S.players.length - 1);
   $('opps').innerHTML = S.players.filter(p => p.id !== viewer).map(p => {
-    const chips = p.piles.map(pl => { const st = SETS[pl.color]; const d = E.pileComplete(S, pl); return `<span class="chip ${d ? 'done' : ''}" style="background:${st.hex};color:${st.text}" title="${esc(pl.cards.map(id => S.cards[id].name).join(', '))}">${esc(st.label)} ${Math.min(pl.cards.length, st.size)}/${st.size}${pl.house != null ? ' 🏠' : ''}${pl.hotel != null ? '🏨' : ''}</span>`; }).join('');
-    return `<div class="opp ${p.id === S.cur ? 'active' : ''}" data-p="${p.id}"><div class="nm"><span>${esc(p.name)}${p.ai ? ' 🤖' : ''}${p.remote && p.away ? ' 📵' : p.remote ? ' 📱' : ''}</span><span>${progLabel(p)}</span></div><div class="meta">${S.teams && p.team === S.players[viewer].team ? '<b>Teammate</b> · ' : ''}Hand ${p.hand.length} · Bank ${E.bankValue(S, p)}M</div><div class="chips">${chips || '<span style="font-size:12px;color:var(--muted)">No properties yet</span>'}</div></div>`;
+    const active = p.id === S.cur && S.winner == null, deciding = S.pending && E.actorNow(S) === p.id;
+    const mate = S.teams && p.team === me.team;
+    return `<div class="opp ${active ? 'active' : ''} ${deciding ? 'deciding' : ''} ${S.teams ? 'team' + p.team : ''}" data-p="${p.id}">
+      <div class="ohead">${avatar(p)}<div class="oname"><b>${esc(p.name)}</b>${p.ai ? '<span class="tag">CPU</span>' : ''}${p.remote ? (p.away ? '<span class="tag off">offline</span>' : '<span class="tag">📱</span>') : ''}${mate ? '<span class="tag mate">teammate</span>' : ''}</div>${active ? '<span class="turntag">' + (S.pending ? '…' : 'playing') + '</span>' : deciding ? '<span class="turntag dec">deciding</span>' : ''}</div>
+      <div class="ostats"><span title="Cards in hand">🂠 ${p.hand.length}</span><span title="Bank">💰 ${E.bankValue(S, p)}M</span><span title="Complete sets" class="prog">★ ${progressText(p)}</span></div>
+      <div class="osets">${p.piles.map(setBar).join('') || '<span class="none">No properties yet</span>'}</div></div>`;
   }).join('');
-  $('opps').querySelectorAll('.opp').forEach(el => el.onclick = () => showPlayer(+el.dataset.p));
+  $('opps').querySelectorAll('.opp').forEach(x => x.onclick = () => showPlayer(+x.dataset.p));
+  // middle
+  $('deckCount').textContent = S.deck.length + ' left';
+  $('discardTop').innerHTML = S.discard.length ? cardHTML(S.discard[S.discard.length - 1], 'xs') : '<div class="card xs empty"></div>';
   // me
-  const me = S.players[viewer];
-  $('me').innerHTML = `<div class="mebox ${viewer === S.cur ? 'active' : ''}"><h3><span>${esc(me.name)}${/^you$/i.test(me.name) ? "" : " (you)"}</span><span>${progLabel(me)}</span></h3>
-    <div class="sec">Bank · ${E.bankValue(S, me)}M</div><div class="bankrow">${me.bank.map(id => `<span class="coin">${esc(S.cards[id].kind === 'money' ? S.cards[id].name : S.cards[id].name + ' ' + S.cards[id].value + 'M')}</span>`).join('') || '<span style="font-size:12px;color:var(--muted)">Empty</span>'}</div>
-    <div class="sec">Properties</div><div class="piles">${me.piles.map(pl => pileHTML(pl, true)).join('') || '<span style="font-size:12px;color:var(--muted)">None yet</span>'}</div></div>`;
-  $('me').querySelectorAll('.mini.flip').forEach(el => el.onclick = () => flipWild(+el.dataset.id));
+  $('me').innerHTML = `<div class="mebox ${S.cur === viewer && S.winner == null ? 'active' : ''} ${S.teams ? 'team' + me.team : ''}">
+    <div class="mehead">${avatar(me)}<b>${esc(me.name)}${youMode() && !/^you$/i.test(me.name) ? ' (you)' : ''}</b>${S.teams ? teamBadge(me.team) : ''}<span class="prog">★ ${progressText(me)} ${S.teams ? 'team sets' : 'sets'}</span></div>
+    <div class="merow"><div id="myBank" class="bankbox"><div class="lbl">Bank</div><div class="bigval">${E.bankValue(S, me)}M</div><div class="coins">${me.bank.map(id => `<span class="coin m${S.cards[id].value}">${S.cards[id].value}</span>`).join('')}</div></div>
+    <div id="myPiles" class="mypiles">${me.piles.map(pl => pileHTML(pl, true)).join('') || '<div class="none">Your properties go here. Tap a property card in your hand to play it.</div>'}</div></div></div>`;
+  $('me').querySelectorAll('.card.flip').forEach(x => x.onclick = () => flipWild(+x.dataset.id));
   // hand
-  const myTurn = S.winner == null && viewer === S.cur && !S.pending && S.phase === 'play';
-  $('handTitle').textContent = 'Your hand (' + me.hand.length + ')';
-  $('playsLeft').textContent = myTurn ? `${3 - S.plays} play${3 - S.plays === 1 ? '' : 's'} left` : (S.winner != null ? '' : 'Waiting for ' + S.players[E.actorNow(S)].name + '…');
-  $('endBtn').disabled = !myTurn;
-  $('hand').innerHTML = me.hand.map(id => cardHTML(id, myTurn && S.plays < 3 ? '' : 'dim')).join('');
-  $('hand').querySelectorAll('.card').forEach(el => el.onclick = () => { if (myTurn) handTap(+el.dataset.id); else showCardInfo(+el.dataset.id); });
+  const hideHand = playing && NET.mode === 'local' && humans().length > 1;
+  $('handTitle').textContent = 'Your hand · ' + me.hand.length;
+  const left = 3 - S.plays;
+  $('playsLeft').innerHTML = myTurn ? `<span class="pips">${[0, 1, 2].map(i => `<i class="${i < left ? 'on' : ''}"></i>`).join('')}</span> Plays left: <b>${left}</b>` : (S.winner != null ? '' : playing ? 'Watching moves…' : 'Waiting for ' + esc(S.players[E.actorNow(S)].name) + '…');
+  $('endBtn').disabled = !myTurn; $('endBtn').classList.toggle('pulse', myTurn && left === 0);
+  $('hand').innerHTML = hideHand ? '<div class="hidden-hand">Hand hidden while moves play</div>' : me.hand.map(id => cardHTML(id, myTurn && left > 0 ? 'playable' : (myTurn ? '' : 'dim'))).join('');
+  $('hand').querySelectorAll('.card').forEach(x => x.onclick = () => handTap(+x.dataset.id, myTurn));
   $('logList').innerHTML = S.log.slice().reverse().map(l => `<div>${esc(l)}</div>`).join('');
 }
 
+// ---------- playback stage ----------
+function eventView(e) {
+  const P = S.players;
+  switch (e.k) {
+    case 'turn': return { icon: '🔄', cap: e.p === viewer && youMode() ? 'Your turn' : `${esc(P[e.p].name)}'s turn`, sub: `${N(e.p)} drew ${e.n} card${e.n === 1 ? '' : 's'}`, cards: Array(Math.min(e.n, 5)).fill('back'), from: ['deck'], to: [e.p, 'hand'], tone: 'turn', quick: true };
+    case 'bank': return { icon: '💰', cap: `${N(e.p)} banked ${S.cards[e.card].value}M`, sub: esc(cname(e.card)) + ' goes to the bank', cards: [e.card], from: [e.p, 'hand'], to: [e.p, 'bank'], quick: e.p === viewer };
+    case 'prop': { const c = S.cards[e.card]; return { icon: '🏡', cap: `${N(e.p)} played ${esc(cname(e.card))}`, sub: `Added to ${POS(e.p)} ${esc(SETS[e.color].label)} set` + (c.kind === 'wild' ? ` (wild used as ${esc(SETS[e.color].label)})` : ''), cards: [e.card], from: [e.p, 'hand'], to: [e.p, 'sets'], quick: e.p === viewer }; }
+    case 'passgo': return { icon: '🚦', cap: `${N(e.p)} played Pass Go`, sub: `${N(e.p)} ${VB(e.p, 'draw', 'draws')} ${e.n} more`, cards: [e.card], from: [e.p, 'hand'], to: ['discard'] };
+    case 'build': return { icon: ICON[S.cards[e.card].act], cap: `${N(e.p)} built a ${esc(S.cards[e.card].name)}`, sub: `On ${POS(e.p)} ${esc(SETS[e.color].label)} set: rent +${S.cards[e.card].value}M`, cards: [e.card], from: [e.p, 'hand'], to: [e.p, 'sets'] };
+    case 'rent': return { icon: '🏷️', cap: `${N(e.p)} ${VB(e.p, 'charge', 'charges')} ${esc(SETS[e.color].label)} rent: ${e.amount}M`, sub: `From ${e.targets.map(N).join(' and ')}` + (e.doubles ? ` · doubled x${Math.pow(2, e.doubles)}` : ''), cards: [e.card], from: [e.p, 'hand'], to: ['discard'], tone: 'attack' };
+    case 'action': {
+      const t = e.targets[0];
+      const M = { birthday: () => [`It's ${N(e.p) === 'You' ? 'your' : N(e.p) + "'s"} birthday!`, `Everyone pays ${N(e.p)} 2M`, [e.card]],
+        debt: () => ['Debt Collector!', `${N(t)} ${VB(t, 'owe', 'owes')} ${N(e.p)} 5M`, [e.card]],
+        sly: () => ['Sly Deal!', `${N(e.p)} ${VB(e.p, 'want', 'wants')} ${POS(t)} ${esc(cname(e.take))}`, [e.card, e.take]],
+        forced: () => ['Forced Deal!', `${N(e.p)} ${VB(e.p, 'swap', 'swaps')} ${esc(cname(e.give))} for ${POS(t)} ${esc(cname(e.take))}`, [e.card, e.give, e.take]],
+        dealbreaker: () => ['Deal Breaker!', `${N(e.p)} ${VB(e.p, 'want', 'wants')} ${POS(t)} complete ${esc(SETS[e.color].label)} set`, [e.card].concat(e.cards.slice(0, 3))] }, m = M[e.act]();
+      return { icon: ICON[e.act], cap: m[0], sub: m[1], cards: m[2], from: [e.p, 'hand'], to: ['discard'], tone: 'attack' }; }
+    case 'boost': return { icon: '✖️2', cap: `${N(e.p)} ${VB(e.p, 'stack', 'stacks')} Double The Rent`, sub: `Teammate's rent is now ${e.amount}M`, cards: Array(Math.min(e.n, 3)).fill(S.cards.findIndex(c => c.act === 'double')), from: [e.p, 'hand'], to: ['discard'], tone: 'attack' };
+    case 'jsn': return { icon: '✋', cap: `${N(e.p)}: Just Say No!`, sub: `Blocking ${esc(e.label)}`, cards: [e.card], from: [e.p, 'hand'], to: ['discard'], tone: 'block' };
+    case 'cancel': return { icon: '🛑', cap: 'Blocked!', sub: `${esc(e.label)} against ${N(e.target)} is cancelled`, cards: [], tone: 'block' };
+    case 'pay': if (!e.total) return { icon: '🤷', cap: `${N(e.from)} ${VB(e.from, 'have', 'has')} nothing to pay`, sub: '', cards: [], quick: true };
+      return { icon: '💸', cap: `${N(e.from)} ${VB(e.from, 'pay', 'pays')} ${N(e.to)} ${e.total}M`, sub: e.all ? 'Everything they had on the table' : e.cards.map(id => esc(cname(id))).join(', '), cards: e.cards.slice(0, 6), from: [e.from, 'bank'], to: [e.to, 'bank'], tone: 'pay' };
+    case 'take': return { icon: '🦊', cap: `${N(e.to)} ${VB(e.to, 'take', 'takes')} ${POS(e.from)} ${esc(cname(e.card))}`, sub: e.give != null ? `${N(e.from)} ${VB(e.from, 'get', 'gets')} ${esc(cname(e.give))} in return` : '', cards: [e.card].concat(e.give != null ? [e.give] : []), from: [e.from, 'sets'], to: [e.to, 'sets'], tone: 'attack' };
+    case 'stealset': return { icon: '💥', cap: `${N(e.to)} ${VB(e.to, 'take', 'takes')} ${POS(e.from)} ${esc(SETS[e.color].label)} set!`, sub: 'The whole set moves, buildings too', cards: e.cards.slice(0, 5), from: [e.from, 'sets'], to: [e.to, 'sets'], tone: 'attack' };
+    case 'flip': return { icon: '🔁', cap: `${N(e.p)} moved a wild`, sub: `${esc(SETS[e.from].label)} → ${esc(SETS[e.color].label)}`, cards: [e.card], from: [e.p, 'sets'], to: [e.p, 'sets'], quick: true };
+    case 'discard': return { icon: '🗑️', cap: `${N(e.p)} discarded ${e.n}`, sub: 'Hands are limited to 7 cards', cards: Array(Math.min(e.n, 4)).fill('back'), from: [e.p, 'hand'], to: ['discard'], quick: true };
+    case 'win': return { icon: '🏆', cap: S.teams ? `${esc(E.TEAM_NAMES[e.team])} wins!` : `${N(e.p)} ${VB(e.p, 'win', 'wins')}!`, sub: '', cards: [] };
+  }
+  return { cap: '', cards: [] };
+}
+function anchorEl(a) {
+  if (!a) return null;
+  if (a[0] === 'deck') return $('deckPile'); if (a[0] === 'discard') return $('discardPile');
+  if (a[0] === viewer) return a[1] === 'bank' ? $('myBank') : a[1] === 'sets' ? $('myPiles') : $('hand');
+  return document.querySelector(`.opp[data-p="${a[0]}"]`);
+}
+function centerOf(el) { const r = (el || $('game')).getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; }
+function wait(ms) { return new Promise(res => { const t = setTimeout(() => { skipStep = null; res(); }, ms); skipStep = () => { clearTimeout(t); skipStep = null; res(); }; }); }
+async function playEvents(evs) {
+  const st = $('stage');
+  for (const e of evs) {
+    if (skipAll) break;
+    if (e.k === 'win') continue;
+    await showEvent(e);
+  }
+  st.classList.add('hidden'); st.className = 'hidden'; skipAll = false;
+}
+async function showEvent(e) {
+  const v = eventView(e), base = SPEEDS[speed], dur = v.quick ? base * 0.6 : base;
+  const st = $('stage');
+  st.className = 'tone-' + (v.tone || 'plain');
+  $('stageCap').innerHTML = `<span class="sicon">${v.icon || ''}</span> ${v.cap}`;
+  $('stageSub').innerHTML = v.sub || '';
+  $('stageCards').innerHTML = v.cards.map(id => cardHTML(id, 'lg')).join('');
+  st.classList.remove('hidden');
+  const cards = [...$('stageCards').children];
+  const src = centerOf(anchorEl(v.from)), fly = Math.min(420, base * 0.3);
+  cards.forEach((c, i) => { const r = c.getBoundingClientRect(); const dx = src.x - (r.left + r.width / 2), dy = src.y - (r.top + r.height / 2);
+    c.animate([{ transform: `translate(${dx}px,${dy}px) scale(.25)`, opacity: .3 }, { transform: 'none', opacity: 1 }], { duration: fly, delay: i * 60, easing: 'cubic-bezier(.2,.8,.2,1)', fill: 'backwards' }); });
+  highlight(v.from, true); highlight(v.to, true);
+  await wait(dur);
+  if (v.to && cards.length && !skipAll) {
+    const dst = centerOf(anchorEl(v.to)), out = Math.min(320, base * 0.25);
+    const anims = cards.map((c, i) => { const r = c.getBoundingClientRect(); const dx = dst.x - (r.left + r.width / 2), dy = dst.y - (r.top + r.height / 2);
+      return c.animate([{ transform: 'none', opacity: 1 }, { transform: `translate(${dx}px,${dy}px) scale(.2)`, opacity: 0.1 }], { duration: out, delay: i * 40, easing: 'ease-in', fill: 'forwards' }); });
+    await Promise.race([Promise.all(anims.map(a => a.finished.catch(() => {}))), wait(out + 200)]);
+  }
+  highlight(v.from, false); highlight(v.to, false);
+}
+function highlight(a, on) { const x = anchorEl(a); if (x) x.classList.toggle('glow', on); }
+
 // ---------- modal helpers ----------
-function openModal(build) { const sh = $('sheet'); sh.innerHTML = ''; build(sh); $('modal').classList.remove('hidden'); }
-function closeModal() { $('modal').classList.add('hidden'); }
+function openModal(build) { const sh = $('sheet'); sh.innerHTML = ''; clearInterval(jsnTimer); build(sh); $('modal').classList.remove('hidden'); }
+function closeModal() { clearInterval(jsnTimer); $('modal').classList.add('hidden'); }
 function el(tag, html, cls) { const e = document.createElement(tag); if (html != null) e.innerHTML = html; if (cls) e.className = cls; return e; }
 function toast(msg) { const t = $('toast'); t.textContent = msg; t.classList.remove('hidden'); clearTimeout(t._t); t._t = setTimeout(() => t.classList.add('hidden'), 2600); }
-function showCardInfo(id) {
-  openModal(sh => { sh.appendChild(el('div', cardHTML(id), 'pick')); sh.appendChild(el('p', cardText(S.cards[id]))); const b = el('button', 'Close', 'ghost big'); b.onclick = closeModal; sh.appendChild(b); });
+function closeBtn(label) { const b = el('button', label || 'Close', 'ghost big'); b.onclick = closeModal; return b; }
+function showCardInfo(id, note) {
+  openModal(sh => { sh.appendChild(el('div', cardHTML(id, 'lg'), 'bigcard')); if (note) sh.appendChild(el('p', note, 'center')); sh.appendChild(closeBtn()); });
 }
 function showPlayer(i) {
   const p = S.players[i];
   openModal(sh => {
-    sh.appendChild(el('h2', esc(p.name)));
-    sh.appendChild(el('p', `Hand ${p.hand.length} cards · Bank ${E.bankValue(S, p)}M (${p.bank.map(id => S.cards[id].value + 'M').join(', ') || 'empty'})`));
-    sh.appendChild(el('div', p.piles.map(pl => pileHTML(pl, false)).join('') || '<p>No properties yet.</p>', 'piles'));
-    const b = el('button', 'Close', 'ghost big'); b.onclick = closeModal; sh.appendChild(b);
+    sh.appendChild(el('h2', avatar(p) + ' ' + esc(p.name)));
+    sh.appendChild(el('p', `Hand ${p.hand.length} cards · Bank ${E.bankValue(S, p)}M · Sets ${progressText(p)}`));
+    sh.appendChild(el('div', p.bank.map(id => cardHTML(id, 'xs')).join('') || '<span class="none">Empty bank</span>', 'bankcards'));
+    sh.appendChild(el('div', p.piles.map(pl => pileHTML(pl, false)).join('') || '<p>No properties yet.</p>', 'mypiles'));
+    sh.appendChild(closeBtn());
   });
 }
 
-// ---------- playing a card (step-by-step wizard over legal actions) ----------
+// ---------- playing a card ----------
 const FIELDS = ['t', 'color', 'target', 'pile', 'take', 'give', 'nd'];
 function sameCard(a, b) { if (a === b) return true; const x = S.cards[a], y = S.cards[b]; return x.kind !== 'prop' && x.kind === y.kind && x.act === y.act && x.value === y.value && x.name === y.name; }
-function handTap(id) {
-  if (S.plays >= 3) { toast('No plays left - end your turn.'); return showCardInfo(id); }
-  const opts = E.legalActions(S).filter(a => a.card != null && a.t !== 'move' && sameCard(a.card, id)).map(a => Object.assign({}, a, { card: id, nd: a.doubles ? a.doubles.length : undefined }));
-  wizard(id, opts, {});
+function rentReason(c) { if (c.any) return "You don't own any properties yet"; return `You don't own any ${SETS[c.colors[0]].label} or ${SETS[c.colors[1]].label} property yet`; }
+const ACT_REASON = { sly: 'Nothing to steal - only properties outside complete sets can be taken', forced: 'You both need a property that is not part of a complete set', dealbreaker: 'No opponent has a complete set yet', house: 'Needs one of your complete sets (not Expressway or Utility) without a House', hotel: 'Needs one of your complete sets that already has a House', debt: 'No one to charge', birthday: 'No one to charge' };
+function handTap(id, myTurn) {
+  const c = S.cards[id];
+  const legal = myTurn ? E.legalActions(S).filter(a => a.card != null && a.t !== 'move' && sameCard(a.card, id)).map(a => Object.assign({}, a, { card: id, nd: a.doubles ? a.doubles.length : undefined })) : [];
+  const g = t => legal.filter(a => a.t === t);
+  const opts = [];
+  const bank = () => opts.push({ label: `💰 Bank it as ${c.value}M`, sub: 'Money in the bank pays debts and rent', acts: g('bank') });
+  if (c.kind === 'money') bank();
+  if (c.kind === 'prop') opts.push({ label: '🏡 Play as property', sub: `Adds to your ${SETS[c.color].label} set`, acts: g('prop') });
+  if (c.kind === 'wild') opts.push({ label: '🏡 Play as property', sub: c.any ? 'Choose any color' : `Choose ${SETS[c.colors[0]].label} or ${SETS[c.colors[1]].label}`, acts: g('prop') });
+  if (c.kind === 'rent') { opts.push({ label: '🏷️ Charge rent', sub: c.any ? 'Pick one of your sets and one player' : 'Every opponent pays', acts: g('rent'), reason: rentReason(c) }); bank(); }
+  if (c.kind === 'action') {
+    if (c.act === 'double') { const canRent = myTurn && S.plays < 2 && S.players[viewer].hand.some(x => S.cards[x].kind === 'rent' && E.legalActions(S).some(a => a.t === 'rent' && sameCard(a.card, x))); opts.push({ label: '✖️2 Double a rent', sub: '', acts: [], reason: canRent ? 'Tap your Rent card - you can add this there' : 'Needs a Rent card you can play and 2 plays left' }); }
+    else if (c.act === 'jsn') opts.push({ label: '✋ Keep for defense', acts: [], reason: "You'll be asked automatically when someone targets you" + (S.teams ? ' or your teammate' : '') });
+    else opts.push({ label: `${ICON[c.act]} Use ${c.name}`, sub: SHORT[c.act], acts: g(c.act), reason: ACT_REASON[c.act] });
+    bank();
+  }
+  openModal(sh => {
+    sh.appendChild(el('div', cardHTML(id, 'lg'), 'bigcard'));
+    if (!myTurn) sh.appendChild(el('p', 'You can play this on your turn.', 'center'));
+    else if (S.plays >= 3) sh.appendChild(el('p', 'No plays left this turn - tap <b>End turn</b>.', 'center'));
+    const box = el('div', null, 'opts');
+    opts.forEach(o => {
+      const ok = o.acts.length > 0;
+      const why = !myTurn ? 'Wait for your turn' : S.plays >= 3 ? 'No plays left' : (o.reason || '');
+      const b = el('button', `<span class="ol">${o.label}</span><small>${ok ? (o.sub || '') : esc(why)}</small>`, ok ? 'opt' : 'opt off');
+      b.disabled = !ok; if (ok) b.onclick = () => wizard(id, o.acts, {}); box.appendChild(b);
+    });
+    sh.appendChild(box); sh.appendChild(closeBtn('Cancel'));
+  });
 }
+function targetLabel(v) { if (v === 'all') return '👥 Every opponent'; const p = S.players[v]; return `${avatar(p)} ${esc(p.name)} <small>💰 ${E.bankValue(S, p)}M bank · ${E.tableValue(S, p)}M on table</small>`; }
 function fieldLabel(f, v, a, id) {
-  const c = S.cards[id], me = S.players[viewer];
+  const me = S.players[viewer];
   switch (f) {
-    case 't': return v === 'bank' ? `💵 Put in bank as ${c.value}M` : v === 'prop' ? '🏡 Play as property' : '▶️ Play ' + esc(c.name);
-    case 'color': return sw(v) + esc(SETS[v].label) + (a.t === 'rent' ? ` - rent ${E.rentFor(S, me, v)}M` : '');
-    case 'target': return v === 'all' ? 'Everyone' : esc(S.players[v].name) + ` (has ${E.tableValue(S, S.players[v])}M on table)`;
-    case 'pile': { const owner = a.t === 'dealbreaker' ? S.players[a.target] : me; const pl = owner.piles.find(x => x.id === v); return sw(pl.color) + esc(SETS[pl.color].label + ': ' + pl.cards.map(x => S.cards[x].kind === 'wild' ? 'Wild' : S.cards[x].name).join(', ')); }
-    case 'take': { const pl = E.findPile(S.players[a.target], v); return sw(pl.color) + 'Take ' + esc(S.cards[v].kind === 'wild' ? SETS[pl.color].label + ' Wild' : S.cards[v].name); }
-    case 'give': { const pl = E.findPile(me, v); return sw(pl.color) + 'Give your ' + esc(S.cards[v].kind === 'wild' ? SETS[pl.color].label + ' Wild' : S.cards[v].name); }
-    case 'nd': return v === 0 ? 'No Double The Rent' : v === 1 ? 'Add 1 Double The Rent (x2, uses a play)' : 'Add 2 Double The Rent (x4, uses 2 plays)';
+    case 't': return v;
+    case 'color': return sw(v) + esc(SETS[v].label) + (a.t === 'rent' ? ` <small>rent ${E.rentFor(S, me, v)}M</small>` : ` <small>${(me.piles.find(p => p.color === v) || { cards: [] }).cards.length}/${SETS[v].size} owned</small>`);
+    case 'target': return targetLabel(v);
+    case 'pile': { const owner = a.t === 'dealbreaker' ? S.players[a.target] : me; const pl = owner.piles.find(x => x.id === v); return `<span class="optcards">${pl.cards.map(x => cardHTML(x, 'xs')).join('')}</span>${esc(SETS[pl.color].label)} set`; }
+    case 'take': { const pl = E.findPile(S.players[a.target], v); return `<span class="optcards">${cardHTML(v, 'xs')}</span>Take ${esc(cname(v))} <small>${esc(SETS[pl.color].label)}</small>`; }
+    case 'give': { const pl = E.findPile(me, v); return `<span class="optcards">${cardHTML(v, 'xs')}</span>Give ${esc(cname(v))} <small>${esc(SETS[pl.color].label)}</small>`; }
+    case 'nd': return v === 0 ? 'No, normal rent' : `Add ${v} Double The Rent <small>x${Math.pow(2, v)} · uses ${v} more play${v > 1 ? 's' : ''}</small>`;
   }
 }
-const QUESTIONS = { t: 'What do you want to do?', color: 'Which set?', target: 'Who do you target?', pile: 'Which set?', take: 'Which property do you take?', give: 'Which of yours do you give?', nd: 'Double the rent?' };
+const QUESTIONS = { color: 'Which set?', target: 'Who do you target?', pile: 'Which set?', take: 'Which property do you take?', give: 'Which of yours do you give?', nd: 'Double the rent?' };
+function describeAction(a) {
+  const me = S.players[viewer], tn = t => t === 'all' ? 'every opponent' : esc(S.players[t].name);
+  switch (a.t) {
+    case 'rent': return `Charge ${esc(SETS[a.color].label)} rent: <b>${E.rentFor(S, me, a.color) * Math.pow(2, a.nd || 0)}M</b> from ${tn(a.target)}`;
+    case 'debt': return `<b>${tn(a.target)}</b> pays you 5M`;
+    case 'birthday': return 'Every opponent pays you 2M';
+    case 'sly': return `Take <b>${esc(cname(a.take))}</b> from ${tn(a.target)}`;
+    case 'forced': return `Give your <b>${esc(cname(a.give))}</b>, take ${tn(a.target)}'s <b>${esc(cname(a.take))}</b>`;
+    case 'dealbreaker': { const pl = S.players[a.target].piles.find(x => x.id === a.pile); return `Take ${tn(a.target)}'s complete <b>${esc(SETS[pl.color].label)}</b> set`; }
+    case 'house': case 'hotel': { const pl = me.piles.find(x => x.id === a.pile); return `Build on your ${esc(SETS[pl.color].label)} set`; }
+    case 'passgo': return 'Draw 2 more cards';
+  }
+  return '';
+}
 function wizard(id, opts, chosen) {
-  if (!opts.length) return showCardInfo(id);
   for (const f of FIELDS) {
+    if (f === 't') continue;
     const vals = [...new Set(opts.map(a => a[f]).filter(v => v !== undefined))];
     if (vals.length > 1 && !(f in chosen)) {
       return openModal(sh => {
-        sh.appendChild(el('div', cardHTML(id), 'pick'));
+        sh.appendChild(el('div', cardHTML(id, 'md'), 'bigcard'));
         sh.appendChild(el('h2', QUESTIONS[f]));
         const box = el('div', null, 'opts');
-        vals.forEach(v => { const b = el('button', fieldLabel(f, v, opts.find(a => a[f] === v), id)); b.onclick = () => { const nc = Object.assign({}, chosen, { [f]: v }); wizard(id, opts.filter(a => a[f] === v), nc); }; box.appendChild(b); });
+        vals.forEach(v => { const b = el('button', fieldLabel(f, v, opts.find(a => a[f] === v), id), 'opt'); b.onclick = () => wizard(id, opts.filter(a => a[f] === v), Object.assign({}, chosen, { [f]: v })); box.appendChild(b); });
         sh.appendChild(box);
-        const cancel = el('button', 'Cancel', 'ghost big'); cancel.onclick = closeModal; sh.appendChild(cancel);
+        const back = el('button', 'Back', 'ghost big'); back.onclick = () => handTap(id, true); sh.appendChild(back);
       });
     }
   }
-  const a = Object.assign({}, opts[0]); delete a.nd;
-  if (a.t === 'rent') { const me = S.players[viewer]; a.doubles = me.hand.filter(x => S.cards[x].act === 'double').slice(0, opts[0].nd); }
-  closeModal(); act(a);
+  const a = Object.assign({}, opts[0]);
+  const fire = () => { const nd = a.nd; delete a.nd; if (a.t === 'rent') a.doubles = S.players[viewer].hand.filter(x => S.cards[x].act === 'double').slice(0, nd); closeModal(); act(a); };
+  if (a.t === 'bank' || a.t === 'prop' || a.t === 'passgo') return fire();
+  openModal(sh => {
+    sh.appendChild(el('div', cardHTML(id, 'md'), 'bigcard'));
+    sh.appendChild(el('h2', 'Confirm'));
+    sh.appendChild(el('p', describeAction(a), 'confirmtxt'));
+    const ok = el('button', '✅ Play it', 'primary big'); ok.onclick = fire;
+    const back = el('button', 'Back', 'ghost big'); back.onclick = () => handTap(id, true);
+    sh.append(ok, back);
+  });
 }
 function flipWild(id) {
   const c = S.cards[id], pl = E.findPile(S.players[viewer], id);
   openModal(sh => {
-    sh.appendChild(el('h2', 'Move this wild to…')); sh.appendChild(el('p', 'Flipping a wild is free and does not use a play.'));
+    sh.appendChild(el('div', cardHTML(id, 'md'), 'bigcard'));
+    sh.appendChild(el('h2', 'Move this wild to…')); sh.appendChild(el('p', 'Moving a wild is free - it does not use a play.'));
     const box = el('div', null, 'opts');
-    c.colors.filter(x => x !== pl.color).forEach(col => { const b = el('button', sw(col) + esc(SETS[col].label)); b.onclick = () => { closeModal(); act({ t: 'move', card: id, color: col }); }; box.appendChild(b); });
-    sh.appendChild(box); const x = el('button', 'Cancel', 'ghost big'); x.onclick = closeModal; sh.appendChild(x);
+    c.colors.filter(x => x !== pl.color).forEach(col => { const b = el('button', sw(col) + esc(SETS[col].label), 'opt'); b.onclick = () => { closeModal(); act({ t: 'move', card: id, color: col }); }; box.appendChild(b); });
+    sh.appendChild(box); sh.appendChild(closeBtn('Cancel'));
   });
 }
 
 // ---------- prompts ----------
-function describePending(pd) {
-  const from = S.players[pd.from].name;
-  if (pd.kind === 'pay') return `${esc(from)} wants ${pd.amount}M from you (${esc(pd.label)}).`;
-  if (pd.kind === 'sly') return `${esc(from)} wants to take your ${esc(S.cards[pd.take].name)} (Sly Deal).`;
-  if (pd.kind === 'forced') return `${esc(from)} wants to swap their ${esc(S.cards[pd.give].name)} for your ${esc(S.cards[pd.take].name)} (Forced Deal).`;
-  const pl = S.players[pd.target].piles.find(x => x.id === pd.pile); return `${esc(from)} wants your complete ${esc(SETS[pl.color].label)} set (Deal Breaker).`;
+let jsnTimer = null;
+function describePending(pd, forPartner) {
+  const from = esc(S.players[pd.from].name), whom = forPartner ? esc(S.players[pd.target].name) : 'you', whose = forPartner ? esc(S.players[pd.target].name) + "'s" : 'your';
+  if (pd.kind === 'pay') return `${from} wants <b>${pd.amount}M</b> from ${whom} (${esc(pd.label)}).`;
+  if (pd.kind === 'sly') return `${from} wants to take ${whose} <b>${esc(cname(pd.take))}</b> (Sly Deal).`;
+  if (pd.kind === 'forced') return `${from} wants to swap their ${esc(cname(pd.give))} for ${whose} <b>${esc(cname(pd.take))}</b> (Forced Deal).`;
+  const pl = S.players[pd.target].piles.find(x => x.id === pd.pile); return `${from} wants ${whose} complete <b>${esc(SETS[pl.color].label)}</b> set (Deal Breaker).`;
+}
+function countdown(sh, secs, onEnd) {
+  const bar = el('div', '<i></i><span></span>', 'countdown'); sh.appendChild(bar);
+  let left = secs; const upd = () => { bar.querySelector('span').textContent = `Auto-skips in ${left}s`; bar.querySelector('i').style.width = (left / secs * 100) + '%'; };
+  upd(); clearInterval(jsnTimer); jsnTimer = setInterval(() => { left--; upd(); if (left <= 0) { clearInterval(jsnTimer); onEnd(); } }, 1000);
 }
 function promptJSN() {
   const pd = S.pending, attacking = pd.chain % 2 === 1, forPartner = attacking ? viewer !== pd.from : viewer !== pd.target;
-  const fromN = esc(S.players[pd.from].name), tgN = esc(S.players[pd.target].name);
+  const tgN = esc(S.players[pd.target].name);
   openModal(sh => {
-    sh.appendChild(el('h2', attacking ? 'Your side was told No!' : forPartner ? 'Your teammate is under attack' : 'Incoming action'));
-    let msg;
-    if (attacking) msg = (forPartner ? `${fromN}'s ` : 'Your ') + `${esc(pd.label)} against ${tgN} was blocked with Just Say No. Counter with your Just Say No to make it go through?`;
-    else msg = (forPartner ? describePending(pd).replace(/from you|your /g, m => m === 'from you' ? 'from ' + tgN : tgN + "'s ") + ' Use your Just Say No to protect your teammate?' : describePending(pd)) + (pd.chain ? ' (A Just Say No was countered.)' : '');
-    sh.appendChild(el('p', msg));
+    if (pd.card != null) sh.appendChild(el('div', cardHTML(pd.card, 'md'), 'bigcard'));
+    sh.appendChild(el('h2', attacking ? '✋ Your side was told No!' : forPartner ? '🛡️ Protect your teammate?' : '⚠️ You are being targeted'));
+    sh.appendChild(el('p', attacking ? `${forPartner ? esc(S.players[pd.from].name) + "'s" : 'Your'} ${esc(pd.label)} against ${tgN} was blocked. Play your Just Say No to push it through?` : describePending(pd, forPartner) + (pd.chain ? ' (Their Just Say No was countered.)' : '')));
     const box = el('div', null, 'opts');
-    const y = el('button', '🛑 Play Just Say No', 'primary'); y.onclick = () => act({ t: 'jsn', use: true });
-    const n = el('button', attacking ? 'Let it be cancelled' : forPartner ? "Don't use it" : 'Accept'); n.onclick = () => act({ t: 'jsn', use: false });
+    const y = el('button', '✋ Play Just Say No', 'primary big'); y.onclick = () => act({ t: 'jsn', use: true });
+    const n = el('button', attacking ? 'Let it be cancelled' : forPartner ? "Don't use it" : 'Accept it', 'big'); n.onclick = () => act({ t: 'jsn', use: false });
     box.append(y, n); sh.appendChild(box);
+    countdown(sh, 25, () => act({ t: 'jsn', use: false }));
   });
 }
 function promptBoost() {
   const pd = S.pending, k = E.countDoubles(S, viewer);
   openModal(sh => {
+    sh.appendChild(el('div', cardHTML(S.players[viewer].hand.find(x => S.cards[x].act === 'double'), 'md'), 'bigcard'));
     sh.appendChild(el('h2', 'Stack Double The Rent?'));
-    sh.appendChild(el('p', `Your teammate ${esc(S.players[pd.from].name)} is charging ${pd.amount}M ${esc(pd.label)} to ${pd.queue.map(i => esc(S.players[i].name)).join(' and ')}. Add your Double The Rent to multiply it. This doesn't use a play.`));
+    sh.appendChild(el('p', `Your teammate ${esc(S.players[pd.from].name)} is charging <b>${pd.amount}M</b> ${esc(pd.label)} to ${pd.queue.map(i => esc(S.players[i].name)).join(' and ')}. Adding yours is free - it doesn't use a play.`));
     const box = el('div', null, 'opts');
-    for (let n = 0; n <= k; n++) { const b = el('button', n === 0 ? 'No thanks' : `Add ${n} (rent becomes ${pd.amount * Math.pow(2, n)}M)`, n ? 'primary' : ''); b.onclick = () => act({ t: 'boost', n }); box.appendChild(b); }
+    for (let n = 1; n <= k; n++) { const b = el('button', `Add ${n} → rent becomes ${pd.amount * Math.pow(2, n)}M`, 'primary big'); b.onclick = () => act({ t: 'boost', n }); box.appendChild(b); }
+    const no = el('button', 'No thanks', 'big'); no.onclick = () => act({ t: 'boost', n: 0 }); box.appendChild(no);
     sh.appendChild(box);
+    countdown(sh, 25, () => act({ t: 'boost', n: 0 }));
   });
 }
 function promptPay() {
   const pd = S.pending, me = S.players[viewer], assets = E.payable(S, me), sel = new Set();
+  const bankIds = assets.filter(id => me.bank.includes(id)), tableIds = assets.filter(id => !me.bank.includes(id));
   openModal(sh => {
-    sh.appendChild(el('h2', `Pay ${pd.amount}M to ${esc(S.players[pd.from].name)}`));
-    sh.appendChild(el('p', describePending(pd) + ' No change is given. Properties you hand over go to their table.'));
-    const list = el('div', null, 'pick');
-    assets.forEach(id => { const pl = E.findPile(me, id); const m = el('div', null); m.innerHTML = miniHTML(id, pl ? pl.color : null, ''); const node = m.firstChild; if (!pl) node.querySelector('span').textContent = 'Bank: ' + S.cards[id].name;
-      if (pl && (pl.house === id || pl.hotel === id)) node.querySelector('span').textContent = (pl.house === id ? 'House' : 'Hotel') + ' on ' + SETS[pl.color].label;
-      node.style.cursor = 'pointer'; node.onclick = () => { sel.has(id) ? sel.delete(id) : sel.add(id); node.classList.toggle('sel'); upd(); }; list.appendChild(node); });
-    sh.appendChild(list);
-    const line = el('div', null, 'payline'); const btn = el('button', 'Pay', 'primary');
-    const upd = () => { const v = E.sumVal(S, [...sel]); line.firstChild.textContent = `Selected ${v}M of ${pd.amount}M`; btn.disabled = !(v >= pd.amount || sel.size === assets.length); };
-    line.append(el('span', ''), btn); sh.appendChild(line);
-    const auto = el('button', 'Suggest payment', 'ghost'); auto.onclick = () => { sel.clear(); AI.choosePayment(S, viewer, pd.amount).forEach(x => sel.add(x)); list.querySelectorAll('.mini').forEach(n => n.classList.toggle('sel', sel.has(+n.dataset.id))); upd(); };
-    sh.appendChild(auto);
-    btn.onclick = () => act({ t: 'pay', cards: [...sel] }); upd();
+    sh.appendChild(el('h2', `💸 You owe ${esc(S.players[pd.from].name)} ${pd.amount}M`));
+    sh.appendChild(el('p', describePending(pd, false) + ' Tap cards to pay. No change is given; properties you hand over go onto their table.'));
+    const meter = el('div', '<div class="meterbar"><i></i></div><div class="metertxt"></div>', 'meter'); sh.appendChild(meter);
+    const mk = (title, ids) => { if (!ids.length) return; sh.appendChild(el('div', title, 'sec'));
+      const row = el('div', ids.map(id => cardHTML(id, 'sm pickable')).join(''), 'pickrow'); sh.appendChild(row);
+      row.querySelectorAll('.card').forEach(n => n.onclick = () => { const id = +n.dataset.id; sel.has(id) ? sel.delete(id) : sel.add(id); n.classList.toggle('sel', sel.has(id)); upd(); }); };
+    mk(`Bank · ${E.sumVal(S, bankIds)}M`, bankIds); mk('Table (properties & buildings)', tableIds);
+    const btn = el('button', 'Pay', 'primary big');
+    const auto = el('button', '✨ Pick for me (least loss)', 'ghost big');
+    const upd = () => { const v = E.sumVal(S, [...sel]); const ok = v >= pd.amount || sel.size === assets.length;
+      meter.querySelector('i').style.width = Math.min(100, v / pd.amount * 100) + '%'; meter.classList.toggle('ok', ok);
+      meter.querySelector('.metertxt').innerHTML = `Selected <b>${v}M</b> of ${pd.amount}M` + (v > pd.amount ? ` <small>(overpaying ${v - pd.amount}M)</small>` : '');
+      btn.disabled = !ok; btn.textContent = ok ? `Pay ${v}M` : `Select ${pd.amount - v}M more`; };
+    auto.onclick = () => { sel.clear(); AI.choosePayment(S, viewer, pd.amount).forEach(x => sel.add(x)); sh.querySelectorAll('.pickrow .card').forEach(n => n.classList.toggle('sel', sel.has(+n.dataset.id))); upd(); };
+    btn.onclick = () => act({ t: 'pay', cards: [...sel] });
+    sh.append(btn, auto); upd();
   });
 }
 function promptDiscard() {
   const me = S.players[viewer], need = me.hand.length - 7, sel = new Set();
   openModal(sh => {
-    sh.appendChild(el('h2', `Discard ${need} card${need > 1 ? 's' : ''}`)); sh.appendChild(el('p', 'You can keep at most 7 cards at the end of your turn.'));
-    const list = el('div', me.hand.map(id => cardHTML(id)).join(''), 'pick'); sh.appendChild(list);
-    const btn = el('button', 'Discard', 'primary big'); btn.disabled = true;
-    list.querySelectorAll('.card').forEach(n => n.onclick = () => { const id = +n.dataset.id; if (sel.has(id)) sel.delete(id); else if (sel.size < need) sel.add(id); n.classList.toggle('sel', sel.has(id)); btn.disabled = sel.size !== need; });
+    sh.appendChild(el('h2', `🗑️ Discard ${need} card${need > 1 ? 's' : ''}`));
+    sh.appendChild(el('p', `You have ${me.hand.length} cards but can only keep 7 at the end of your turn. Pick ${need} to put on the discard pile.`));
+    const list = el('div', me.hand.map(id => cardHTML(id, 'sm pickable')).join(''), 'pickrow wrap'); sh.appendChild(list);
+    const btn = el('button', `Select ${need} card${need > 1 ? 's' : ''}`, 'primary big'); btn.disabled = true;
+    list.querySelectorAll('.card').forEach(n => n.onclick = () => { const id = +n.dataset.id; if (sel.has(id)) sel.delete(id); else if (sel.size < need) sel.add(id); n.classList.toggle('sel', sel.has(id)); btn.disabled = sel.size !== need; btn.textContent = sel.size === need ? 'Discard' : `Select ${need - sel.size} more`; });
     btn.onclick = () => act({ t: 'discard', cards: [...sel] }); sh.appendChild(btn);
   });
 }
 function showWinner() {
-  localStorage.removeItem(SAVE);
+  if (NET.mode !== 'client') localStorage.removeItem(SAVE);
   const w = S.winner >= 0 ? S.players[S.winner] : null;
   $('pass').classList.add('hidden');
   openModal(sh => {
-    sh.appendChild(el('div', '<div class="sun"></div>'));
+    sh.appendChild(el('div', '<div class="trophy">🏆</div>'));
     if (w && S.teams) {
       const mates = S.players.filter(p => p.team === S.winnerTeam);
-      sh.appendChild(el('h2', `🎉 ${esc(E.TEAM_NAMES[S.winnerTeam])} wins! (${mates.map(p => esc(p.name)).join(' & ')})`));
-      sh.appendChild(el('div', mates.map(m => m.piles.filter(pl => E.pileComplete(S, pl)).map(pl => pileHTML(pl, false)).join('')).join(''), 'piles'));
+      sh.appendChild(el('h2', `${esc(E.TEAM_NAMES[S.winnerTeam])} wins! (${mates.map(p => esc(p.name)).join(' & ')})`, 'center'));
+      sh.appendChild(el('div', mates.map(m => m.piles.filter(pl => E.pileComplete(S, pl)).map(pl => pileHTML(pl, false)).join('')).join(''), 'mypiles'));
     } else {
-    sh.appendChild(el('h2', w ? `🎉 ${esc(w.name)} wins!` : 'Game drawn'));
-    if (w) sh.appendChild(el('div', w.piles.filter(pl => E.pileComplete(S, pl)).map(pl => pileHTML(pl, false)).join(''), 'piles'));
+      sh.appendChild(el('h2', w ? `${esc(w.name)} wins!` : 'Game drawn', 'center'));
+      if (w) sh.appendChild(el('div', w.piles.filter(pl => E.pileComplete(S, pl)).map(pl => pileHTML(pl, false)).join(''), 'mypiles'));
     }
     if (NET.mode === 'host') { const rm = el('button', 'Rematch with this room', 'primary big'); rm.onclick = () => { closeModal(); NET.rematch(); }; sh.appendChild(rm); }
-    if (NET.mode === 'client') sh.appendChild(el('p', 'The host can start a rematch.'));
+    if (NET.mode === 'client') sh.appendChild(el('p', 'The host can start a rematch.', 'center'));
     const again = el('button', NET.mode === 'local' ? 'New game' : 'Leave room', NET.mode === 'local' ? 'primary big' : 'ghost big'); again.onclick = () => { closeModal(); NET.leave(); backToSetup(); }; sh.appendChild(again);
     const look = el('button', 'Look at the table', 'ghost big'); look.onclick = closeModal; sh.appendChild(look);
   });
 }
-function backToSetup() { clearTimeout(aiTimer); S = null; $('lobby').classList.add('hidden'); NET.refreshSetup(); $('game').classList.add('hidden'); $('pass').classList.add('hidden'); $('setup').classList.remove('hidden'); $('resumeBtn').classList.toggle('hidden', !localStorage.getItem(SAVE)); }
+function backToSetup() { clearTimeout(aiTimer); skipAll = true; if (skipStep) skipStep(); S = null; shown = null; playing = false; $('stage').className = 'hidden'; $('lobby').classList.add('hidden'); NET.refreshSetup(); $('game').classList.add('hidden'); $('pass').classList.add('hidden'); $('setup').classList.remove('hidden'); $('resumeBtn').classList.toggle('hidden', !localStorage.getItem(SAVE)); }
+
+// ---------- first-game tips ----------
+const TIPS = [
+  ['🎯', 'Goal', 'Collect <b>3 complete property sets</b> of different colors (5 between you and your teammate in Team mode).'],
+  ['🃏', 'Your turn', 'You draw 2 cards, then play up to <b>3 cards</b>. Tap any card in your hand to see what you can do with it.'],
+  ['💰', 'Bank vs. properties', 'Bank money and spare action cards to pay rent and debts. Properties go on your table and never into the bank.'],
+  ['👀', 'Follow the action', 'Every move shows in the middle of the screen. Tap it to skip a step; change the speed with the speed button at the top.'],
+];
+function maybeTips(force) {
+  if (!force && (localStorage.getItem('cbd-tips') || speed === 'instant')) return;
+  let i = 0;
+  const show = () => openModal(sh => {
+    const [ic, h, t] = TIPS[i];
+    sh.appendChild(el('div', ic, 'tipicon')); sh.appendChild(el('h2', h, 'center')); sh.appendChild(el('p', t, 'center tiptxt'));
+    sh.appendChild(el('div', TIPS.map((_, k) => `<i class="${k === i ? 'on' : ''}"></i>`).join(''), 'dots'));
+    const nx = el('button', i < TIPS.length - 1 ? 'Next' : "Got it - let's play", 'primary big'); nx.onclick = () => { if (++i < TIPS.length) show(); else { localStorage.setItem('cbd-tips', '1'); closeModal(); loop(); } };
+    const sk = el('button', 'Skip tips', 'ghost big'); sk.onclick = () => { localStorage.setItem('cbd-tips', '1'); closeModal(); loop(); };
+    sh.append(nx, sk);
+  });
+  show();
+}
 
 // ---------- help ----------
 function buildHelp() {
@@ -340,15 +550,20 @@ document.querySelectorAll('[data-close]').forEach(b => b.onclick = () => $(b.dat
 $('logBtn').onclick = () => $('logPanel').classList.toggle('hidden');
 $('helpBtn').onclick = $('helpBtn0').onclick = () => { buildHelp(); $('helpPanel').classList.remove('hidden'); };
 $('endBtn').onclick = () => act({ t: 'end' });
+$('speedBtn').onclick = () => { const order = ['slow', 'normal', 'fast']; speed = order[(order.indexOf(speed) + 1) % 3]; localStorage.setItem('cbd-speed', speed); render(); toast('Move speed: ' + speed); };
+$('stage').onclick = e => { if (e.target.id === 'skipAllBtn') { skipAll = true; } if (skipStep) skipStep(); };
+$('feed').onclick = () => $('logPanel').classList.toggle('hidden');
 $('menuBtn').onclick = () => openModal(sh => {
   sh.appendChild(el('h2', 'Menu'));
   const box = el('div', null, 'opts');
-  const sp = el('button', 'Computer speed: ' + (AI_DELAY > 400 ? 'Normal' : 'Fast')); sp.onclick = () => { AI_DELAY = AI_DELAY > 400 ? 250 : 700; closeModal(); loop(); };
+  const sp = el('div', ['slow', 'normal', 'fast'].map(k => `<button data-s="${k}" class="${speed === k ? 'on' : ''}">${{ slow: '🐢 Slow', normal: '▶ Normal', fast: '⏩ Fast' }[k]}</button>`).join(''), 'seg speedseg');
+  sp.querySelectorAll('button').forEach(b => b.onclick = () => { speed = b.dataset.s; localStorage.setItem('cbd-speed', speed); closeModal(); loop(); });
+  const tipsB = el('button', '💡 Show the quick tips again'); tipsB.onclick = () => maybeTips(true);
   const q = el('button', NET.mode === 'client' ? 'Leave online game' : NET.mode === 'host' ? 'End online game for everyone' : 'Quit to main menu (game is saved)');
   q.onclick = () => { closeModal(); if (NET.mode === 'host') { localStorage.removeItem(SAVE); NET.leave(); } else if (NET.mode === 'client') NET.leave(); else save(); backToSetup(); };
   if (NET.mode === 'host') { const inv = el('button', '📨 Room ' + NET.code + ' - share invite again'); inv.onclick = () => NET.shareInvite(); box.append(inv); }
   const r = el('button', 'Resume'); r.onclick = () => { closeModal(); loop(); };
-  box.append(r, sp, q); sh.appendChild(box);
+  box.append(r, el('div', 'Move speed', 'sec'), sp, tipsB, q); sh.appendChild(box);
 });
 // ---------- online play: host-authoritative peer-to-peer (PeerJS public broker, no accounts) ----------
 const DECK = E.buildDeck();
@@ -456,7 +671,8 @@ const NET = {
     if (i < 0) return;
     if (msg.t === 'act') {
       if (!S || S.winner != null || E.actorNow(S) !== i) { conn.send({ t: 'error', msg: 'Not your move right now.' }); return this.sendState(i); }
-      try { E.apply(S, msg.a); } catch (e) { conn.send({ t: 'error', msg: e.message }); return this.sendState(i); }
+      if (!playing) shown = snapshot();
+      try { E.apply(S, msg.a); } catch (e) { shown = null; conn.send({ t: 'error', msg: e.message }); return this.sendState(i); }
       loop();
     } else if (msg.t === 'bye') { this.dropConn(conn); }
   },
@@ -537,7 +753,7 @@ const NET = {
     switch (msg.t) {
       case 'welcome': this.seat = msg.seat; this.everJoined = true; this.status('Joined! Waiting for the host to start.'); break;
       case 'lobby': this.seat = msg.seat; this._teams = !!msg.teams; if (!S) { this.showLobby(); this.renderLobby(msg.seats, msg.total); } break;
-      case 'state': { this.seat = msg.seat; this.ver = msg.ver; S = msg.S; S.cards = DECK; viewer = msg.seat;
+      case 'state': { this.seat = msg.seat; this.ver = msg.ver; const prev = S; if (!playing && prev) shown = prev; S = msg.S; S.cards = DECK; viewer = msg.seat; if (!prev) lastSeq = S.evSeq || 0;
         if ($('game').classList.contains('hidden')) { $('lobby').classList.add('hidden'); $('setup').classList.add('hidden'); $('game').classList.remove('hidden'); }
         loop(); break; }
       case 'error': toast(msg.msg); break;
@@ -583,6 +799,6 @@ function openJoin(code) {
 }
 setupOnline();
 
-window.__cbd = { get state() { return S; }, get viewer() { return viewer; }, get net() { return NET; }, act, loop, setDelay: d => { AI_DELAY = d; }, setGrace: g => { NET.grace = g; } };
+window.__cbd = { get state() { return S; }, get viewer() { return viewer; }, get net() { return NET; }, get playing() { return playing; }, act, loop, setDelay: d => { AI_DELAY = d; if (d < 100) speed = 'instant'; }, setSpeed: s => { speed = s; }, setGrace: g => { NET.grace = g; } };
 initSetup();
 })();

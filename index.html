@@ -46,16 +46,25 @@
 
 <div id="game" class="screen hidden">
   <header>
-    <div class="title">City Beautiful Deal</div>
-    <div id="turnInfo"></div>
-    <div class="hbtns"><button id="logBtn" class="icon" title="Game log">Log</button><button id="helpBtn" class="icon" title="Rules">?</button><button id="menuBtn" class="icon" title="Menu">☰</button></div>
+    <div class="title">City Beautiful <span>Deal</span></div>
+    <div id="turnPill"></div>
+    <div class="hbtns"><button id="speedBtn" class="icon" title="Move speed"></button><button id="logBtn" class="icon" title="Game log">Log</button><button id="helpBtn" class="icon" title="Rules">?</button><button id="menuBtn" class="icon" title="Menu">☰</button></div>
   </header>
-  <div id="opps"></div>
-  <div id="me"></div>
+  <div id="feed" title="Recent moves - tap for the full log"></div>
+  <div id="board">
+    <div id="opps"></div>
+    <div id="tableMid">
+      <div id="deckPile" class="pilebox"><div class="card xs back"><div class="backart"><span class="sun"></span></div></div><span id="deckCount"></span></div>
+      <div class="midhint">Moves play out here</div>
+      <div id="discardPile" class="pilebox"><div id="discardTop"></div><span>Discard</span></div>
+    </div>
+    <div id="me"></div>
+  </div>
   <div id="handWrap">
     <div id="handBar"><span id="handTitle"></span><span id="playsLeft"></span><button id="endBtn" class="primary">End turn</button></div>
     <div id="hand"></div>
   </div>
+  <div id="stage" class="hidden"><div class="stage-inner"><div id="stageCap"></div><div id="stageCards"></div><div id="stageSub"></div><div class="stage-hint">Tap to skip · <button id="skipAllBtn">Skip all ⏭</button></div></div></div>
   <div id="toast" class="hidden"></div>
 </div>
 
