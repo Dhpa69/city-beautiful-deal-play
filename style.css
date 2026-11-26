@@ -85,3 +85,7 @@ header .title{font-weight:800;color:var(--accent2);white-space:nowrap}
 .dot{width:10px;height:10px;border-radius:50%;background:#6c6}.dot.open{background:#888}.dot.off{background:#e66}
 .jform{display:flex;flex-direction:column;gap:8px}.txt{padding:12px;border-radius:10px;border:0;background:#ffffff1f;color:var(--ink);font:inherit;font-size:17px}.txt.code{text-transform:uppercase;letter-spacing:6px;font-weight:800;text-align:center}
 .setup-card .sec{font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)}
+
+.tbadge{display:inline-block;padding:1px 6px;border-radius:6px;font-size:11px;font-weight:800;color:#1d1300}
+.tbtn{padding:4px 8px;font-size:12px;font-weight:800;color:#1d1300}
+.seat .tsel{width:92px}

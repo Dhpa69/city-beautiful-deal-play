@@ -52,6 +52,11 @@ function newGame(opts) {
   const cards = buildDeck();
   const s = { cards, deck: [], discard: [], players: [], cur: 0, plays: 0, phase: 'play', pending: null, winner: null, log: [], pileSeq: 1, turn: 0, rs: (opts.seed == null ? (Date.now() ^ (Math.random()*1e9)) : opts.seed) | 0, maxTurns: opts.maxTurns || 2000 };
   s.players = opts.players.map((p, i) => ({ id: i, name: p.name || ('Player ' + (i+1)), ai: !!p.ai, hand: [], bank: [], piles: [] }));
+  if (opts.teams) {
+    const tm = opts.teams.slice(0, s.players.length);
+    if (s.players.length !== 4 || tm.filter(x => x === 0).length !== 2 || tm.filter(x => x === 1).length !== 2) throw new Error('Team mode needs 4 players in two teams of 2');
+    s.teams = tm; s.players.forEach((p, i) => { p.team = tm[i]; });
+  }
   if (s.players.length < 2 || s.players.length > 5) throw new Error('2-5 players');
   s.deck = shuffle(s, cards.map(c => c.id));
   for (let r=0;r<5;r++) s.players.forEach(p => draw(s, p, 1));
@@ -137,8 +142,21 @@ const sumVal = (s, ids) => ids.reduce((t, id) => t + C(s, id).value, 0);
 function tableValue(s, p) { return sumVal(s, payable(s, p)); }
 function bankValue(s, p) { return sumVal(s, p.bank); }
 
+const TEAM_NAMES = ['Team Orange', 'Team Blue'];
+function teamOf(s, i) { return s.teams ? s.teams[i] : i; }
+function sameTeam(s, a, b) { return a === b || (!!s.teams && s.teams[a] === s.teams[b]); }
+function teammates(s, i) { return s.teams ? s.players.map(p => p.id).filter(j => j !== i && s.teams[j] === s.teams[i]) : []; }
+function teamColors(s, team) { const set = new Set(); s.players.forEach(p => { if (teamOf(s, p.id) === team) completeColors(s, p).forEach(c => set.add(c)); }); return set; }
+function setsNeeded(s) { return s.teams ? 5 : 3; }
+function progress(s, i) { return s.teams ? teamColors(s, s.teams[i]).size : completeColors(s, P(s, i)).size; }
 function checkWin(s) {
   if (s.winner != null) return;
+  if (s.teams) {
+    const order = s.players.map((_, i) => (s.cur + i) % s.players.length);
+    for (const i of order) if (teamColors(s, s.teams[i]).size >= 5) { s.winner = i; s.winnerTeam = s.teams[i]; s.phase = 'over'; s.pending = null;
+      log(s, TEAM_NAMES[s.teams[i]] + ' (' + s.players.filter(p => p.team === s.teams[i]).map(p => p.name).join(' & ') + ') wins with 5 complete sets!'); return; }
+    return;
+  }
   const order = s.players.map((_, i) => (s.cur + i) % s.players.length);
   for (const i of order) if (completeColors(s, P(s, i)).size >= 3) { s.winner = i; s.phase = 'over'; s.pending = null; log(s, P(s, i).name + ' wins with 3 complete sets!'); return; }
 }
@@ -146,12 +164,13 @@ function checkWin(s) {
 // ---------- whose decision ----------
 function actorNow(s) {
   if (s.winner != null) return null;
-  if (s.pending) return s.pending.stage === 'jsn' ? s.pending.responder : s.pending.target;
+  if (s.pending) return (s.pending.stage === 'jsn' || s.pending.stage === 'boost') ? s.pending.responder : s.pending.target;
   return s.cur;
 }
 function hasJSN(s, i) { return P(s, i).hand.some(id => C(s, id).act === 'jsn'); }
 
-function opponents(s) { return s.players.map((_, i) => i).filter(i => i !== s.cur); }
+function opponents(s) { return s.players.map((_, i) => i).filter(i => !sameTeam(s, i, s.cur)); }
+function countDoubles(s, i) { return P(s, i).hand.filter(id => C(s, id).act === 'double').length; }
 
 function legalActions(s) {
   const out = [];
@@ -159,6 +178,7 @@ function legalActions(s) {
   if (s.pending) {
     const pd = s.pending;
     if (pd.stage === 'jsn') return [{ t: 'jsn', use: true }, { t: 'jsn', use: false }];
+    if (pd.stage === 'boost') { const out2 = []; for (let n = 0; n <= countDoubles(s, pd.responder); n++) out2.push({ t: 'boost', n }); return out2; }
     return [{ t: 'pay' }]; // card choice made by player; validated in apply
   }
   const p = P(s, s.cur);
@@ -250,7 +270,7 @@ function apply(s, a) {
       const amount = rentFor(s, p, a.color) * Math.pow(2, ds.length);
       const targets = a.target === 'all' ? opponents(s) : [a.target];
       log(s, p.name + ' charged ' + SETS[a.color].label + ' rent: ' + amount + 'M' + (ds.length ? ' (doubled' + (ds.length > 1 ? ' twice' : '') + ')' : '') + ' from ' + (a.target === 'all' ? 'everyone' : P(s, a.target).name) + '.');
-      beginEffect(s, { kind: 'pay', label: SETS[a.color].label + ' rent', amount, targets }); break; }
+      beginEffect(s, { kind: 'pay', label: SETS[a.color].label + ' rent', amount, targets, rent: true }); break; }
     case 'birthday': s.discard.push(a.card); log(s, p.name + " played It's My Birthday: 2M from everyone."); beginEffect(s, { kind: 'pay', label: "It's My Birthday", amount: 2, targets: opponents(s) }); break;
     case 'debt': s.discard.push(a.card); log(s, p.name + ' played Debt Collector on ' + P(s, a.target).name + ' (5M).'); beginEffect(s, { kind: 'pay', label: 'Debt Collector', amount: 5, targets: [a.target] }); break;
     case 'sly': s.discard.push(a.card); log(s, p.name + ' played Sly Deal on ' + P(s, a.target).name + "'s " + C(s, a.take).name + '.'); beginEffect(s, { kind: 'sly', label: 'Sly Deal', targets: [a.target], take: a.take }); break;
@@ -261,17 +281,29 @@ function apply(s, a) {
 }
 
 function beginEffect(s, eff) {
-  s.pending = Object.assign({ from: s.cur, queue: eff.targets.slice(), target: null, stage: 'next', chain: 0, responder: null }, eff);
+  s.pending = Object.assign({ from: s.cur, queue: eff.targets.slice(), target: null, stage: 'next', chain: 0, responder: null, declined: [] }, eff);
+  if (eff.rent && s.teams) s.pending.stage = 'boost';
   advance(s);
 }
+// players who may answer with Just Say No right now: the side being hit on even chain, the attacking side on odd chain
+function jsnSide(s, pd) { const lead = pd.chain % 2 ? pd.from : pd.target; return [lead].concat(teammates(s, lead)); }
 function advance(s) {
   const pd = s.pending;
   for (;;) {
+    if (pd.stage === 'boost') { // teammates of the renter may add their own Double The Rent (free)
+      const who = teammates(s, pd.from).find(j => !pd.declined.includes(j) && countDoubles(s, j) > 0);
+      if (who != null) { pd.responder = who; return; }
+      pd.stage = 'next'; pd.declined = [];
+    }
     if (pd.stage === 'next') {
       if (!pd.queue.length) { s.pending = null; checkWin(s); return; }
-      pd.target = pd.queue.shift(); pd.chain = 0; pd.responder = pd.target; pd.stage = 'jsn';
+      pd.target = pd.queue.shift(); pd.chain = 0; pd.declined = []; pd.responder = pd.target; pd.stage = 'jsn';
     }
-    if (pd.stage === 'jsn') { if (hasJSN(s, pd.responder)) return; pd.stage = pd.chain % 2 ? 'skip' : 'apply'; }
+    if (pd.stage === 'jsn') {
+      const who = jsnSide(s, pd).find(j => !pd.declined.includes(j) && hasJSN(s, j));
+      if (who != null) { pd.responder = who; return; }
+      pd.stage = pd.chain % 2 ? 'skip' : 'apply';
+    }
     if (pd.stage === 'skip') { log(s, pd.label + ' against ' + P(s, pd.target).name + ' was cancelled.'); pd.stage = 'next'; continue; }
     if (pd.stage === 'apply') { if (applyEffect(s, pd)) return; pd.stage = 'next'; if (s.winner != null) { s.pending = null; return; } }
   }
@@ -306,14 +338,22 @@ function transfer(s, payer, recv, ids) {
 }
 function applyPending(s, a) {
   const pd = s.pending;
+  if (pd.stage === 'boost') {
+    if (a.t !== 'boost') throw new Error('expected Double The Rent decision');
+    const n = a.n | 0, r = P(s, pd.responder);
+    if (n < 0 || n > countDoubles(s, pd.responder)) throw new Error('not enough Double The Rent cards');
+    for (let k = 0; k < n; k++) { const d = r.hand.find(id => C(s, id).act === 'double'); fromHand(s, r, d); s.discard.push(d); pd.amount *= 2; }
+    if (n) log(s, r.name + ' stacked ' + n + ' Double The Rent on ' + P(s, pd.from).name + "'s rent: now " + pd.amount + 'M.');
+    pd.declined.push(pd.responder);
+    return advance(s);
+  }
   if (pd.stage === 'jsn') {
     if (a.t !== 'jsn') throw new Error('expected Just Say No decision');
     if (a.use) {
       const r = P(s, pd.responder); const j = r.hand.find(id => C(s, id).act === 'jsn'); if (j == null) throw new Error('no Just Say No');
-      fromHand(s, r, j); s.discard.push(j); pd.chain++;
-      log(s, r.name + ' played Just Say No!');
-      pd.responder = pd.responder === pd.target ? pd.from : pd.target;
-    } else pd.stage = pd.chain % 2 ? 'skip' : 'apply';
+      fromHand(s, r, j); s.discard.push(j); pd.chain++; pd.declined = [];
+      log(s, r.name + ' played Just Say No' + (pd.responder !== pd.target && pd.responder !== pd.from ? ' for their teammate' : '') + '!');
+    } else pd.declined.push(pd.responder);
     return advance(s);
   }
   if (pd.stage === 'pay') {
@@ -338,6 +378,6 @@ function allCardLocations(s) {
   return ids;
 }
 
-const api = { SETS, COLORS, ACTIONS, buildDeck, newGame, legalActions, apply, actorNow, rentFor, pileComplete, completeColors, payable, sumVal, tableValue, bankValue, hasJSN, allCardLocations, opponents, findPile };
+const api = { TEAM_NAMES, teamOf, sameTeam, teammates, teamColors, setsNeeded, progress, countDoubles, SETS, COLORS, ACTIONS, buildDeck, newGame, legalActions, apply, actorNow, rentFor, pileComplete, completeColors, payable, sumVal, tableValue, bankValue, hasJSN, allCardLocations, opponents, findPile };
 if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.CBD = api;
 })(typeof window !== 'undefined' ? window : globalThis);

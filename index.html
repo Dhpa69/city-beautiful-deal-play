@@ -16,6 +16,8 @@
     <div class="logo"><span class="sun"></span><h1>City Beautiful Deal</h1><p>Collect three complete Orlando-area sets to win.</p></div>
     <div class="row"><label>Players</label><div class="seg" id="countSeg"><button data-n="2">2</button><button data-n="3">3</button><button data-n="4" class="on">4</button></div></div>
     <div class="row"><label>Mode</label><div class="seg" id="modeSeg"><button data-m="ai" class="on">Me vs computer</button><button data-m="pp">Pass &amp; play</button></div></div>
+    <div class="row"><label>Teams</label><div class="seg" id="teamSeg"><button data-t="0" class="on">Off</button><button data-t="1">2 vs 2</button></div></div>
+    <p id="teamHint" class="muted hidden" style="font-size:13px;margin:0 0 6px">Two teams of two. A team needs 5 complete sets between both teammates.</p>
     <div id="seats"></div>
     <button id="startBtn" class="primary big">Start game</button>
     <button id="resumeBtn" class="ghost big hidden">Continue saved game</button>
@@ -33,6 +35,7 @@
     <p class="center muted">Room code</p><div id="lobbyCode" class="roomcode">…</div>
     <button id="lobbyInvite" class="primary big">📨 Send invite</button>
     <div class="row" id="lobbyCount"><label>Players</label><div class="seg"><button data-n="2">2</button><button data-n="3">3</button><button data-n="4">4</button></div></div>
+    <div class="row" id="lobbyTeams"><label>Teams</label><div class="seg"><button data-t="0" class="on">Off</button><button data-t="1">2 vs 2</button></div></div>
     <div id="lobbySeats"></div>
     <p id="lobbyStatus" class="center muted"></p>
     <button id="lobbyStart" class="primary big">Start game</button>

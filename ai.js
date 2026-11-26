@@ -11,10 +11,11 @@ function propGain(s, p, color, cardId) {
   const size = SETS[color].size, n = colorCount(s, p, color) + 1;
   const pile = p.piles.find(pl => pl.color === color && !E.pileComplete(s, pl));
   const real = !C(s, cardId).any || (pile && pile.cards.some(id => !C(s, id).any));
-  const done = E.completeColors(s, p);
-  if (n >= size && real) return (!done.has(color) && done.size >= 2) ? 2000 : (done.has(color) ? 60 : 150);
+  const done = doneSets(s, p), need = E.setsNeeded(s);
+  if (n >= size && real) return (!done.has(color) && done.size >= need - 1) ? 2000 : (done.has(color) ? 60 : 150);
   return 30 + 60 * n / size + SETS[color].value * 2 - (done.has(color) ? 15 : 0);
 }
+function doneSets(s, p) { return s.teams ? E.teamColors(s, s.teams[p.id]) : E.completeColors(s, p); }
 function lossOf(s, p, id) { // how much the owner loses giving up a table card
   const pl = E.findPile(p, id); if (!pl) return C(s, id).value;
   if (E.pileComplete(s, pl)) return 80 + C(s, id).value;
@@ -48,8 +49,8 @@ function score(s, a) {
     case 'birthday': return E.opponents(s).reduce((t, i) => t + Math.min(2, E.tableValue(s, s.players[i])), 0) * 12 - 5;
     case 'sly': { const tg = s.players[a.target]; const pl = E.findPile(tg, a.take); return propGain(s, p, pl.color, a.take) + 10 + 10 * pl.cards.length / SETS[pl.color].size; }
     case 'forced': { const tg = s.players[a.target]; const pl = E.findPile(tg, a.take); return propGain(s, p, pl.color, a.take) - lossOf(s, p, a.give) - 10; }
-    case 'dealbreaker': { const pl = s.players[a.target].piles.find(x => x.id === a.pile); const done = E.completeColors(s, p);
-      return (!done.has(pl.color) && done.size >= 2) ? 5000 : 300 + SETS[pl.color].value * 10 + (pl.house != null ? 30 : 0) + (pl.hotel != null ? 40 : 0); }
+    case 'dealbreaker': { const pl = s.players[a.target].piles.find(x => x.id === a.pile); const done = doneSets(s, p);
+      return (!done.has(pl.color) && done.size >= E.setsNeeded(s) - 1) ? 5000 : 300 + SETS[pl.color].value * 10 + (pl.house != null ? 30 : 0) + (pl.hotel != null ? 40 : 0); }
     case 'house': return 90; case 'hotel': return 95;
   }
   return 0;
@@ -81,6 +82,7 @@ function choose(s) {
   const pd = s.pending;
   if (pd) {
     if (pd.stage === 'jsn') return { t: 'jsn', use: stake(s, pd, who === pd.from) >= 3 };
+    if (pd.stage === 'boost') { const rich = Math.max(...E.opponents(s).map(i => E.tableValue(s, s.players[i]))); return { t: 'boost', n: pd.amount >= 2 && rich > pd.amount ? E.countDoubles(s, who) : 0 }; }
     return { t: 'pay', cards: choosePayment(s, who, pd.amount) };
   }
   const p = s.players[s.cur];

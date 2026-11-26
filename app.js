@@ -6,15 +6,18 @@ const $ = id => document.getElementById(id);
 const esc = t => String(t).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const SAVE = 'cbd-save-v1';
 let S = null, viewer = 0, aiTimer = null, AI_DELAY = 700;
-let setup = { n: 4, mode: 'ai', seats: [] };
+let setup = { n: 4, mode: 'ai', seats: [], teams: false };
+const TEAM_HEX = ['#ff9f1c', '#4ea8ff'];
+function teamBadge(team) { return `<span class="tbadge" style="background:${TEAM_HEX[team]}">${E.TEAM_NAMES[team].replace('Team ', '')}</span>`; }
+function progLabel(p) { if (!S.teams) return E.completeColors(S, p).size + '/3 sets'; return teamBadge(p.team) + ' ' + E.teamColors(S, p.team).size + '/5 team sets'; }
 
 // ---------- setup ----------
 function seatDefaults() {
   const names = ['You', 'Lake Eola Lou', 'Citrus Sam', 'Gator Gail'];
   for (let i = 0; i < 4; i++) {
     if (!setup.seats[i]) setup.seats[i] = {};
-    if (setup.mode === 'ai') { setup.seats[i] = { name: i === 0 ? 'You' : names[i], ai: i !== 0 }; }
-    else { setup.seats[i] = { name: 'Player ' + (i + 1), ai: false }; }
+    if (setup.mode === 'ai') { setup.seats[i] = { name: i === 0 ? 'You' : names[i], ai: i !== 0, team: i % 2 }; }
+    else { setup.seats[i] = { name: 'Player ' + (i + 1), ai: false, team: i % 2 }; }
   }
 }
 function renderSeats() {
@@ -22,7 +25,8 @@ function renderSeats() {
   for (let i = 0; i < setup.n; i++) {
     const st = setup.seats[i];
     const d = document.createElement('div'); d.className = 'seat';
-    d.innerHTML = `<input maxlength="16" value="${esc(st.name)}" aria-label="Seat ${i + 1} name"><select><option value="h">Human</option><option value="a">Computer</option></select>`;
+    d.innerHTML = `<input maxlength="16" value="${esc(st.name)}" aria-label="Seat ${i + 1} name"><select><option value="h">Human</option><option value="a">Computer</option></select>` + (setup.teams ? `<select class="tsel"><option value="0">Orange</option><option value="1">Blue</option></select>` : '');
+    if (setup.teams) { const ts = d.querySelector('.tsel'); ts.value = String(st.team); ts.style.background = TEAM_HEX[st.team] + '55'; ts.onchange = e => { st.team = +e.target.value; renderSeats(); }; }
     d.querySelector('input').oninput = e => st.name = e.target.value;
     const sel = d.querySelector('select'); sel.value = st.ai ? 'a' : 'h'; sel.onchange = e => st.ai = e.target.value === 'a';
     box.appendChild(d);
@@ -30,7 +34,10 @@ function renderSeats() {
 }
 function initSetup() {
   seatDefaults(); renderSeats();
-  $('countSeg').querySelectorAll('button').forEach(b => b.onclick = () => { setup.n = +b.dataset.n; $('countSeg').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b)); renderSeats(); });
+  $('teamSeg').querySelectorAll('button').forEach(b => b.onclick = () => { setup.teams = b.dataset.t === '1'; $('teamSeg').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+    if (setup.teams) { setup.n = 4; $('countSeg').querySelectorAll('button').forEach(x => x.classList.toggle('on', +x.dataset.n === 4)); }
+    $('teamHint').classList.toggle('hidden', !setup.teams); renderSeats(); });
+  $('countSeg').querySelectorAll('button').forEach(b => b.onclick = () => { if (setup.teams && +b.dataset.n !== 4) return toast('Team mode is 4 players (2 vs 2).'); setup.n = +b.dataset.n; $('countSeg').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b)); renderSeats(); });
   $('modeSeg').querySelectorAll('button').forEach(b => b.onclick = () => { setup.mode = b.dataset.m; $('modeSeg').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b)); seatDefaults(); renderSeats(); });
   $('startBtn').onclick = startGame;
   $('resumeBtn').classList.toggle('hidden', !localStorage.getItem(SAVE));
@@ -39,7 +46,9 @@ function initSetup() {
 function startGame() {
   const players = setup.seats.slice(0, setup.n).map((s, i) => ({ name: (s.name || '').trim() || ('Player ' + (i + 1)), ai: s.ai }));
   if (!players.some(p => !p.ai)) { toast('Make at least one seat Human.'); return; }
-  S = E.newGame({ players });
+  let teams;
+  if (setup.teams) { teams = setup.seats.slice(0, 4).map(s => s.team); if (teams.filter(x => x === 0).length !== 2) return toast('Each team needs exactly 2 players.'); }
+  S = E.newGame({ players, teams });
   viewer = players.findIndex(p => !p.ai);
   showGame();
 }
@@ -55,7 +64,7 @@ function loop() {
   if (NET.mode === 'host') NET.broadcastState();
   if (S.winner != null) return showWinner();
   const who = E.actorNow(S);
-  if (NET.mode === 'client') { $('pass').classList.add('hidden'); if (who !== viewer) return; if (S.pending) return S.pending.stage === 'jsn' ? promptJSN() : promptPay(); if (S.phase === 'discard') return promptDiscard(); return; }
+  if (NET.mode === 'client') { $('pass').classList.add('hidden'); if (who !== viewer) return; if (S.pending) return S.pending.stage === 'jsn' ? promptJSN() : S.pending.stage === 'boost' ? promptBoost() : promptPay(); if (S.phase === 'discard') return promptDiscard(); return; }
   const pl = S.players[who];
   if (pl.remote && !pl.ai) {
     if (!pl.away) return; // waiting for that phone
@@ -65,7 +74,7 @@ function loop() {
   if (pl.ai) { aiTimer = setTimeout(() => { act(AI.choose(S)); }, S.pending ? AI_DELAY * 0.8 : AI_DELAY); return; }
   if (humans().length > 1 && passedTo !== who) return showPass(who);
   viewer = who; $('pass').classList.add('hidden'); render();
-  if (S.pending) return S.pending.stage === 'jsn' ? promptJSN() : promptPay();
+  if (S.pending) return S.pending.stage === 'jsn' ? promptJSN() : S.pending.stage === 'boost' ? promptBoost() : promptPay();
   if (S.phase === 'discard') return promptDiscard();
 }
 function act(a) {
@@ -126,12 +135,12 @@ function render() {
   // opponents
   $('opps').innerHTML = S.players.filter(p => p.id !== viewer).map(p => {
     const chips = p.piles.map(pl => { const st = SETS[pl.color]; const d = E.pileComplete(S, pl); return `<span class="chip ${d ? 'done' : ''}" style="background:${st.hex};color:${st.text}" title="${esc(pl.cards.map(id => S.cards[id].name).join(', '))}">${esc(st.label)} ${Math.min(pl.cards.length, st.size)}/${st.size}${pl.house != null ? ' 🏠' : ''}${pl.hotel != null ? '🏨' : ''}</span>`; }).join('');
-    return `<div class="opp ${p.id === S.cur ? 'active' : ''}" data-p="${p.id}"><div class="nm"><span>${esc(p.name)}${p.ai ? ' 🤖' : ''}${p.remote && p.away ? ' 📵' : p.remote ? ' 📱' : ''}</span><span>${E.completeColors(S, p).size}/3 sets</span></div><div class="meta">Hand ${p.hand.length} · Bank ${E.bankValue(S, p)}M</div><div class="chips">${chips || '<span style="font-size:12px;color:var(--muted)">No properties yet</span>'}</div></div>`;
+    return `<div class="opp ${p.id === S.cur ? 'active' : ''}" data-p="${p.id}"><div class="nm"><span>${esc(p.name)}${p.ai ? ' 🤖' : ''}${p.remote && p.away ? ' 📵' : p.remote ? ' 📱' : ''}</span><span>${progLabel(p)}</span></div><div class="meta">${S.teams && p.team === S.players[viewer].team ? '<b>Teammate</b> · ' : ''}Hand ${p.hand.length} · Bank ${E.bankValue(S, p)}M</div><div class="chips">${chips || '<span style="font-size:12px;color:var(--muted)">No properties yet</span>'}</div></div>`;
   }).join('');
   $('opps').querySelectorAll('.opp').forEach(el => el.onclick = () => showPlayer(+el.dataset.p));
   // me
   const me = S.players[viewer];
-  $('me').innerHTML = `<div class="mebox ${viewer === S.cur ? 'active' : ''}"><h3><span>${esc(me.name)}${/^you$/i.test(me.name) ? "" : " (you)"}</span><span>${E.completeColors(S, me).size}/3 sets</span></h3>
+  $('me').innerHTML = `<div class="mebox ${viewer === S.cur ? 'active' : ''}"><h3><span>${esc(me.name)}${/^you$/i.test(me.name) ? "" : " (you)"}</span><span>${progLabel(me)}</span></h3>
     <div class="sec">Bank · ${E.bankValue(S, me)}M</div><div class="bankrow">${me.bank.map(id => `<span class="coin">${esc(S.cards[id].kind === 'money' ? S.cards[id].name : S.cards[id].name + ' ' + S.cards[id].value + 'M')}</span>`).join('') || '<span style="font-size:12px;color:var(--muted)">Empty</span>'}</div>
     <div class="sec">Properties</div><div class="piles">${me.piles.map(pl => pileHTML(pl, true)).join('') || '<span style="font-size:12px;color:var(--muted)">None yet</span>'}</div></div>`;
   $('me').querySelectorAll('.mini.flip').forEach(el => el.onclick = () => flipWild(+el.dataset.id));
@@ -222,14 +231,28 @@ function describePending(pd) {
   const pl = S.players[pd.target].piles.find(x => x.id === pd.pile); return `${esc(from)} wants your complete ${esc(SETS[pl.color].label)} set (Deal Breaker).`;
 }
 function promptJSN() {
-  const pd = S.pending, mineAction = pd.responder === pd.from;
+  const pd = S.pending, attacking = pd.chain % 2 === 1, forPartner = attacking ? viewer !== pd.from : viewer !== pd.target;
+  const fromN = esc(S.players[pd.from].name), tgN = esc(S.players[pd.target].name);
   openModal(sh => {
-    sh.appendChild(el('h2', mineAction ? `${esc(S.players[pd.target].name)} said Just Say No!` : 'Incoming action'));
-    sh.appendChild(el('p', mineAction ? `Your ${esc(pd.label)} is blocked. Counter with your own Just Say No to make it go through?` : describePending(pd) + (pd.chain ? ' They countered your Just Say No.' : '')));
+    sh.appendChild(el('h2', attacking ? 'Your side was told No!' : forPartner ? 'Your teammate is under attack' : 'Incoming action'));
+    let msg;
+    if (attacking) msg = (forPartner ? `${fromN}'s ` : 'Your ') + `${esc(pd.label)} against ${tgN} was blocked with Just Say No. Counter with your Just Say No to make it go through?`;
+    else msg = (forPartner ? describePending(pd).replace(/from you|your /g, m => m === 'from you' ? 'from ' + tgN : tgN + "'s ") + ' Use your Just Say No to protect your teammate?' : describePending(pd)) + (pd.chain ? ' (A Just Say No was countered.)' : '');
+    sh.appendChild(el('p', msg));
     const box = el('div', null, 'opts');
     const y = el('button', '🛑 Play Just Say No', 'primary'); y.onclick = () => act({ t: 'jsn', use: true });
-    const n = el('button', mineAction ? 'Let it be cancelled' : 'Accept'); n.onclick = () => act({ t: 'jsn', use: false });
+    const n = el('button', attacking ? 'Let it be cancelled' : forPartner ? "Don't use it" : 'Accept'); n.onclick = () => act({ t: 'jsn', use: false });
     box.append(y, n); sh.appendChild(box);
+  });
+}
+function promptBoost() {
+  const pd = S.pending, k = E.countDoubles(S, viewer);
+  openModal(sh => {
+    sh.appendChild(el('h2', 'Stack Double The Rent?'));
+    sh.appendChild(el('p', `Your teammate ${esc(S.players[pd.from].name)} is charging ${pd.amount}M ${esc(pd.label)} to ${pd.queue.map(i => esc(S.players[i].name)).join(' and ')}. Add your Double The Rent to multiply it. This doesn't use a play.`));
+    const box = el('div', null, 'opts');
+    for (let n = 0; n <= k; n++) { const b = el('button', n === 0 ? 'No thanks' : `Add ${n} (rent becomes ${pd.amount * Math.pow(2, n)}M)`, n ? 'primary' : ''); b.onclick = () => act({ t: 'boost', n }); box.appendChild(b); }
+    sh.appendChild(box);
   });
 }
 function promptPay() {
@@ -266,8 +289,14 @@ function showWinner() {
   $('pass').classList.add('hidden');
   openModal(sh => {
     sh.appendChild(el('div', '<div class="sun"></div>'));
+    if (w && S.teams) {
+      const mates = S.players.filter(p => p.team === S.winnerTeam);
+      sh.appendChild(el('h2', `🎉 ${esc(E.TEAM_NAMES[S.winnerTeam])} wins! (${mates.map(p => esc(p.name)).join(' & ')})`));
+      sh.appendChild(el('div', mates.map(m => m.piles.filter(pl => E.pileComplete(S, pl)).map(pl => pileHTML(pl, false)).join('')).join(''), 'piles'));
+    } else {
     sh.appendChild(el('h2', w ? `🎉 ${esc(w.name)} wins!` : 'Game drawn'));
     if (w) sh.appendChild(el('div', w.piles.filter(pl => E.pileComplete(S, pl)).map(pl => pileHTML(pl, false)).join(''), 'piles'));
+    }
     if (NET.mode === 'host') { const rm = el('button', 'Rematch with this room', 'primary big'); rm.onclick = () => { closeModal(); NET.rematch(); }; sh.appendChild(rm); }
     if (NET.mode === 'client') sh.appendChild(el('p', 'The host can start a rematch.'));
     const again = el('button', NET.mode === 'local' ? 'New game' : 'Leave room', NET.mode === 'local' ? 'primary big' : 'ghost big'); again.onclick = () => { closeModal(); NET.leave(); backToSetup(); }; sh.appendChild(again);
@@ -296,6 +325,13 @@ function buildHelp() {
   <h3>Action cards (34)</h3><table><tr><th>Card</th><th>Value</th><th>What it does</th></tr>${acts}</table>
   <p>Any action can be banked as money instead. Double The Rent must be played together with a Rent card and counts as a play. Houses and Hotels on a set that breaks up go to the owner's bank.</p>
   <h3>Money (20)</h3><p>1M ×6 · 2M ×5 · 3M ×3 · 4M ×3 · 5M ×2 · 10M ×1. Total deck: 106 cards.</p>
+  <h3>Team mode (2 vs 2)</h3><ul>
+  <li>Four players in two teams of two; by default teammates sit opposite each other (seats 1 &amp; 3 vs 2 &amp; 4).</li>
+  <li>A team wins with <b>5 complete sets of different colors</b> counted across both teammates' tables (the same color complete on both counts once).</li>
+  <li>Rent, Debt Collector and It's My Birthday only hit the other team. Sly Deal, Forced Deal and Deal Breaker can't target your teammate.</li>
+  <li>Stack Double The Rent: play several with one Rent card on your turn (each uses a play). When your teammate charges rent, you may add your own Double The Rent cards before anyone pays - those are free.</li>
+  <li>Just Say No: when anyone on your team is targeted, either teammate may block it, and either player on the attacking team may counter.</li>
+  <li>Teammates keep separate hands and banks; each pays from their own table.</li></ul>
   <h3>Modes</h3><p>2-4 players. Mix human and computer seats. With more than one human, a cover screen hides each hand while the device is passed.</p>`;
 }
 
@@ -354,17 +390,20 @@ const NET = {
     $('lobbyCount').querySelectorAll('button').forEach(b => b.classList.toggle('on', +b.dataset.n === total));
     $('lobbyStart').classList.toggle('hidden', !host);
     $('lobbyWait').classList.toggle('hidden', host);
-    $('lobbySeats').innerHTML = (seats || []).slice(0, total).map((s, i) => `<div class="lseat"><span class="dot ${s.kind === 'open' ? 'open' : s.kind === 'remote' && !s.connected ? 'off' : 'on'}"></span><b>${esc(s.kind === 'open' ? 'Open seat' : s.name)}</b><span>${s.kind === 'host' ? 'Host' : s.kind === 'remote' ? (s.connected ? 'Joined' : 'Reconnecting…') : s.kind === 'ai' ? 'Computer' : 'Computer fills this if nobody joins'}${this.mode === 'client' && i === this.seat ? ' · you' : ''}</span></div>`).join('');
+    const teams = host ? this.room.teams : this._teams;
+    $('lobbyTeams').classList.toggle('hidden', !host); $('lobbyTeams').querySelectorAll('button').forEach(b => b.classList.toggle('on', (b.dataset.t === '1') === !!teams));
+    $('lobbySeats').innerHTML = (seats || []).slice(0, total).map((s, i) => `<div class="lseat" data-i="${i}">${teams ? `<button class="tbtn" data-i="${i}" style="background:${TEAM_HEX[s.team || 0]}">${E.TEAM_NAMES[s.team || 0].replace('Team ', '')}</button>` : ''}<span class="dot ${s.kind === 'open' ? 'open' : s.kind === 'remote' && !s.connected ? 'off' : 'on'}"></span><b>${esc(s.kind === 'open' ? 'Open seat' : s.name)}</b><span>${s.kind === 'host' ? 'Host' : s.kind === 'remote' ? (s.connected ? 'Joined' : 'Reconnecting…') : s.kind === 'ai' ? 'Computer' : 'Computer fills this if nobody joins'}${this.mode === 'client' && i === this.seat ? ' · you' : ''}</span></div>`).join('') + (teams ? `<p class="center muted" style="font-size:12px">${host ? 'Tap a team badge to switch a seat. ' : ''}Team mode: 2 vs 2, a team needs 5 sets.</p>` : '');
+    if (host && teams) $('lobbySeats').querySelectorAll('.tbtn').forEach(b => b.onclick = () => { const s = this.room.seats[+b.dataset.i]; s.team = (s.team || 0) ? 0 : 1; this.broadcastLobby(); });
   },
   // ----- host -----
   host(name, total) {
     this.leave(); this.leaving = false; this.mode = 'host'; this.name = name;
-    this.room = { total, seats: [{ kind: 'host', name, connected: true }].concat(Array.from({ length: 3 }, () => ({ kind: 'open', name: '' }))), started: false };
+    this.room = { total, teams: false, seats: [{ kind: 'host', name, connected: true, team: 0 }].concat([1, 2, 3].map(i => ({ kind: 'open', name: '', team: i % 2 }))), started: false };
     this.openPeer(rid(5), 0);
   },
-  roomSave() { return { code: this.code, total: this.room.total, seats: this.room.seats.map(s => ({ kind: s.kind, name: s.name, token: s.token })), started: this.room.started }; },
+  roomSave() { return { code: this.code, total: this.room.total, teams: this.room.teams, seats: this.room.seats.map(s => ({ kind: s.kind, name: s.name, token: s.token, team: s.team })), started: this.room.started }; },
   resumeHost(r) {
-    this.leave(); this.leaving = false; this.mode = 'host'; this.room = { total: r.total, seats: r.seats.map(s => Object.assign({}, s, { connected: s.kind === 'host' })), started: true };
+    this.leave(); this.leaving = false; this.mode = 'host'; this.room = { total: r.total, teams: r.teams, seats: r.seats.map(s => Object.assign({}, s, { connected: s.kind === 'host' })), started: true };
     S.players.forEach(p => { if (p.remote) p.away = p.away || Date.now(); });
     this.openPeer(r.code, 0, true); showGame();
   },
@@ -391,7 +430,7 @@ const NET = {
   dropConn(conn) {
     const i = this.seatOfConn(conn); if (i < 0) return;
     const s = this.room.seats[i]; s.conn = null; s.connected = false;
-    if (!this.room.started) { this.room.seats[i] = { kind: 'open', name: '' }; this.broadcastLobby(); return; }
+    if (!this.room.started) { this.room.seats[i] = { kind: 'open', name: '', team: s.team }; this.broadcastLobby(); return; }
     if (S && S.players[i] && S.players[i].remote) { S.players[i].away = Date.now(); log2(S.players[i].name + ' disconnected. The computer plays for them after ' + Math.round(this.grace / 1000) + 's until they rejoin.'); loop(); }
   },
   onHostMsg(conn, msg) {
@@ -405,7 +444,7 @@ const NET = {
         if (room.started) { conn.send({ t: 'fatal', msg: 'That game has already started.' }); return setTimeout(() => conn.close(), 500); }
         i = room.seats.findIndex((s, k) => k < room.total && s.kind === 'open');
         if (i < 0) { conn.send({ t: 'fatal', msg: 'That room is full.' }); return setTimeout(() => conn.close(), 500); }
-        room.seats[i] = { kind: 'remote', name, token };
+        room.seats[i] = { kind: 'remote', name, token, team: room.seats[i].team };
       }
       const s = room.seats[i]; if (s.conn && s.conn !== conn) { try { s.conn.close(); } catch (e) {} }
       s.conn = conn; s.connected = true; s.lastSeen = Date.now();
@@ -421,22 +460,24 @@ const NET = {
       loop();
     } else if (msg.t === 'bye') { this.dropConn(conn); }
   },
-  setTotal(n) { const joined = this.room.seats.filter(s => s.kind !== 'open').length; if (n < joined) return toast('Already ' + joined + ' players joined.'); this.room.total = n; this.broadcastLobby(); },
+  setTeams(on) { if (on && this.room.seats.filter(s => s.kind !== 'open').length > 4) return; this.room.teams = on; if (on) this.room.total = 4; this.broadcastLobby(); },
+  setTotal(n) { if (this.room.teams && n !== 4) return toast('Team mode is 4 players (2 vs 2).'); const joined = this.room.seats.filter(s => s.kind !== 'open').length; if (n < joined) return toast('Already ' + joined + ' players joined.'); this.room.total = n; this.broadcastLobby(); },
   broadcastLobby() {
     this.renderLobby();
-    const seats = this.room.seats.map(s => ({ kind: s.kind, name: s.name, connected: !!s.connected }));
-    this.room.seats.forEach((s, i) => { if (s.conn && s.conn.open) s.conn.send({ t: 'lobby', seats, total: this.room.total, seat: i }); });
+    const seats = this.room.seats.map(s => ({ kind: s.kind, name: s.name, connected: !!s.connected, team: s.team }));
+    this.room.seats.forEach((s, i) => { if (s.conn && s.conn.open) s.conn.send({ t: 'lobby', seats, total: this.room.total, seat: i, teams: this.room.teams }); });
   },
   start() {
     const room = this.room; room.started = true;
     room.seats.forEach((s, i) => { if (i < room.total && s.kind === 'open') { s.kind = 'ai'; s.name = ['Lake Eola Lou', 'Citrus Sam', 'Gator Gail'][i - 1] || ('Computer ' + i); } });
     const players = room.seats.slice(0, room.total).map(s => ({ name: s.name, ai: s.kind === 'ai' }));
-    S = E.newGame({ players });
+    let teams; if (room.teams) { teams = room.seats.slice(0, 4).map(s => s.team || 0); if (teams.filter(x => x === 0).length !== 2) { room.started = false; room.seats.forEach(s => { if (s.kind === 'ai') { s.kind = 'open'; s.name = ''; } }); this.broadcastLobby(); return toast('Each team needs exactly 2 seats.'); } }
+    S = E.newGame({ players, teams });
     S.players.forEach((p, i) => { if (room.seats[i].kind === 'remote') { p.remote = true; if (!room.seats[i].connected) p.away = Date.now(); } });
     viewer = 0; $('lobby').classList.add('hidden'); showGame();
   },
   rematch() {
-    const old = S.players; S = E.newGame({ players: old.map(p => ({ name: p.name, ai: p.ai })), first: (S.winner >= 0 ? S.winner : 0) });
+    const old = S.players; S = E.newGame({ players: old.map(p => ({ name: p.name, ai: p.ai })), teams: S.teams, first: (S.winner >= 0 ? S.winner : 0) });
     S.players.forEach((p, i) => { p.remote = !!old[i].remote; p.away = old[i].away || null; });
     loop();
   },
@@ -495,7 +536,7 @@ const NET = {
     if (!msg) return; this.lastHost = Date.now(); this.retryUntil = Date.now() + 180000;
     switch (msg.t) {
       case 'welcome': this.seat = msg.seat; this.everJoined = true; this.status('Joined! Waiting for the host to start.'); break;
-      case 'lobby': this.seat = msg.seat; if (!S) { this.showLobby(); this.renderLobby(msg.seats, msg.total); } break;
+      case 'lobby': this.seat = msg.seat; this._teams = !!msg.teams; if (!S) { this.showLobby(); this.renderLobby(msg.seats, msg.total); } break;
       case 'state': { this.seat = msg.seat; this.ver = msg.ver; S = msg.S; S.cards = DECK; viewer = msg.seat;
         if ($('game').classList.contains('hidden')) { $('lobby').classList.add('hidden'); $('setup').classList.add('hidden'); $('game').classList.remove('hidden'); }
         loop(); break; }
@@ -518,6 +559,7 @@ function setupOnline() {
   $('joinBtn').onclick = () => openJoin('');
   $('rejoinBtn').onclick = () => { const c = JSON.parse(localStorage.getItem(CLIENT_KEY) || 'null'); if (c) NET.join(c.code, c.name); };
   $('lobbyCount').querySelectorAll('button').forEach(b => b.onclick = () => NET.setTotal(+b.dataset.n));
+  $('lobbyTeams').querySelectorAll('button').forEach(b => b.onclick = () => NET.setTeams(b.dataset.t === '1'));
   $('lobbyStart').onclick = () => NET.start();
   $('lobbyInvite').onclick = () => NET.shareInvite();
   $('lobbyLeave').onclick = () => { NET.leave(); backToSetup(); };
