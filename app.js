@@ -603,38 +603,42 @@ async function unseal(key, buf) {
 }
 // A Relay connects to every broker, subscribes to one inbox topic, and delivers decrypted messages in order.
 class Relay {
-  constructor(code, inbox, onMsg, onStatus) { this.code = code; this.inbox = inbox; this.onMsg = onMsg; this.onStatus = onStatus || (() => {}); this.clients = []; this.ok = []; this.closed = false; this.q = Promise.resolve(); this.rq = Promise.resolve(); }
+  constructor(code, inbox, onMsg, onStatus) { this.code = code; this.inbox = inbox; this.onMsg = onMsg; this.onStatus = onStatus || (() => {}); this.clients = []; this.ok = []; this.seen = new Set(); this.seenQ = []; this.extra = []; this.closed = false; this.q = Promise.resolve(); this.rq = Promise.resolve(); }
   async start() {
     const rc = await roomCrypto(this.code); this.topic = rc.topic; this.key = rc.key;
     if (this.closed) return;
     if (!window.mqtt) { this.onStatus('nolib'); return; }
     BROKERS.forEach((b, i) => {
-      const will = this.will ? { topic: this.topic + '/h', payload: 'G:' + this.will, qos: 0, retain: false } : undefined;
+      const will = this.will ? { topic: this.topic + '/h', payload: 'G:' + this.will, qos: 0, retain: false } : this.hostWill ? { topic: this.topic + '/room', payload: '', qos: 0, retain: true } : undefined;
       const c = window.mqtt.connect(b.url, Object.assign({ clientId: 'cbd' + rid(10).toLowerCase(), keepalive: 20, reconnectPeriod: 2500, connectTimeout: 9000, clean: true, will, protocolVersion: 4 }, b.opts || {}));
       this.clients[i] = c; this.ok[i] = false;
-      c.on('connect', () => { c.subscribe(this.topic + this.inbox, { qos: 1 }, err => { this.ok[i] = !err; this.onStatus('change', i); }); });
+      c.on('connect', () => { c.subscribe([this.topic + this.inbox].concat(this.extra.map(x => this.topic + x)), { qos: 1 }, err => { this.ok[i] = !err; this.onStatus('change', i); if (!err && this.onUp) this.onUp(i); }); });
       c.on('close', () => { if (this.ok[i]) { this.ok[i] = false; this.onStatus('change', i); } });
       c.on('offline', () => { if (this.ok[i]) { this.ok[i] = false; this.onStatus('change', i); } });
       c.on('error', () => {});
       c.on('message', (t, payload) => {
         const raw = new Uint8Array(payload);
         if (raw[0] === 71 && raw[1] === 58) { const cid = UNTXT.decode(raw.subarray(2)); this.rq = this.rq.then(() => this.onMsg({ t: 'gone' }, i, cid)); return; }
-        this.rq = this.rq.then(() => unseal(this.key, raw)).then(m => { if (m && !this.closed) this.onMsg(m.m || m, i, m.f); }).catch(() => {});
+        if (!raw.length) return; // cleared retained message
+        this.rq = this.rq.then(() => unseal(this.key, raw)).then(m => { if (!m || this.closed) return; if (m.u) { if (this.seen.has(m.u)) return; this.seen.add(m.u); this.seenQ.push(m.u); if (this.seenQ.length > 800) this.seen.delete(this.seenQ.shift()); } this.onMsg(m.m || m, i, m.f, t); }).catch(() => {});
       });
     });
   }
   up() { return this.ok.filter(Boolean).length; }
-  send(i, sub, obj) {
-    const c = this.clients[i]; if (!c || this.closed) return false;
-    this.q = this.q.then(() => seal(this.key, obj)).then(p => { if (c.connected) c.publish(this.topic + sub, p, { qos: 1 }); }).catch(() => {});
-    return !!this.ok[i];
+  // Like Star Tiles: every message goes out on every connected broker; receivers drop duplicates by id.
+  sendAll(sub, obj, retain) {
+    if (this.closed) return 0; obj.u = obj.u || rid(10);
+    this.q = this.q.then(() => seal(this.key, obj)).then(p => { this.clients.forEach(c => { if (c.connected) c.publish(this.topic + sub, p, { qos: 1, retain: !!retain }); }); }).catch(() => {});
+    return this.up();
   }
-  wake() { this.clients.forEach(c => { try { if (!c.connected && !c.reconnecting) c.reconnect(); } catch (e) {} }); }
+  sendOne(i, sub, obj, retain) { const c = this.clients[i]; if (!c || this.closed) return; this.q = this.q.then(() => seal(this.key, obj)).then(p => { if (c.connected) c.publish(this.topic + sub, p, { qos: 1, retain: !!retain }); }).catch(() => {}); }
+  clearRetained(sub) { this.clients.forEach(c => { try { if (c.connected) c.publish(this.topic + sub, '', { qos: 1, retain: true }); } catch (e) {} }); }
+  wake(force) { this.clients.forEach(c => { try { if (force) { c.end(true, {}, () => { if (!this.closed) c.reconnect(); }); } else if (!c.connected && !c.reconnecting) c.reconnect(); } catch (e) {} }); }
   end() { this.closed = true; this.clients.forEach(c => { try { c.end(true); } catch (e) {} }); this.clients = []; }
 }
 // A virtual connection to one remote phone (host side) or to the host (phone side).
 function makeConn(relay, sub, wrap) {
-  return { open: true, broker: -1, send(msg) { if (this.open && this.broker >= 0) relay.send(this.broker, sub, wrap ? wrap(msg) : msg); }, close() { this.open = false; } };
+  return { open: true, broker: -1, send(msg) { if (this.open) relay.sendAll(sub, wrap ? wrap(msg) : msg); }, close() { this.open = false; } };
 }
 const NET = {
   mode: 'local', relay: null, code: null, grace: 30000, room: null, conns: {}, conn: null, seat: null, token: null, name: '', leaving: false, hb: null, lastHost: 0, retryUntil: 0, cid: null, aid: 0, pendingAct: null,
@@ -647,7 +651,7 @@ const NET = {
   leave() {
     this.leaving = true; clearInterval(this.hb); clearTimeout(this._knock); clearTimeout(this._rt);
     try { if (this.mode === 'client' && this.conn && this.conn.open) this.conn.send({ t: 'bye' }); } catch (e) {}
-    const r = this.relay; if (r) setTimeout(() => r.end(), 300);
+    const r = this.relay; if (r) { if (this.mode === 'host') r.clearRetained('/room'); setTimeout(() => r.end(), 400); }
     if (this.mode === 'client') localStorage.removeItem(CLIENT_KEY);
     this.mode = 'local'; this.relay = null; this.conn = null; this.conns = {}; this.room = null; this.code = null; this.pendingAct = null;
     const pill = $('netPill'); if (pill) pill.classList.add('hidden');
@@ -702,6 +706,8 @@ const NET = {
       if (up) { this.status(`Room open (${up} of ${BROKERS.length} relays). Share the invite, then tap Start.`, 'good'); if (!announced) { announced = true; if (resuming) toast('Room ' + code + ' reopened - players can rejoin.'); } }
       else this.status(Date.now() - started > 9000 ? "Can't reach the online service. Check your internet connection, then tap Retry." : 'Opening room…', Date.now() - started > 9000 ? 'bad' : '');
     });
+    relay.hostWill = true;
+    relay.onUp = i => relay.sendOne(i, '/room', { t: 'room', at: Date.now() }, true); // retained: joiners can see the room exists even if the host is briefly away
     this.relay = relay; relay.start();
     clearTimeout(this._chk); this._chk = setTimeout(() => { if (this.relay === relay && !relay.up()) this.status("Can't reach the online service. Check your internet connection, then tap Retry.", 'bad'); }, 10000);
     this.startHeartbeat();
@@ -709,7 +715,7 @@ const NET = {
   onRelayHost(msg, bi, cid) {
     if (!cid || typeof cid !== 'string' || cid.length > 40) return;
     let conn = this.conns[cid];
-    if (msg.t === 'gone') { if (conn && conn.broker === bi) { conn.close(); this.dropConn(conn); delete this.conns[cid]; } return; }
+    if (msg.t === 'gone') { const i = conn ? this.seatOfConn(conn) : -1; if (i >= 0) this.room.seats[i].lastSeen = Math.min(this.room.seats[i].lastSeen || 0, Date.now() - 18000); return; } // one relay dropped: drop the player only if the others go quiet too
     if (!conn || !conn.open) { conn = makeConn(this.relay, '/c/' + cid); conn.cid = cid; this.conns[cid] = conn; }
     conn.broker = bi; // reply on whichever relay this phone used last
     if (msg.t === 'knock') return conn.send({ t: 'here', code: this.code });
@@ -809,7 +815,7 @@ const NET = {
     this.showLobby(); this.renderLobby([], 0); this.status('Connecting to room ' + code + '…');
     this.retryUntil = Date.now() + 180000; this.knockStart = Date.now();
     const relay = new Relay(code, '/c/' + this.cid, (msg, bi) => this.onRelayClient(msg, bi), () => { if (this.relay !== relay || !relay.up()) return; if (!this.conn || !this.conn.open) this.knock(true); else this.conn.send({ t: 'sync' }); });
-    relay.will = this.cid; this.relay = relay;
+    relay.will = this.cid; relay.extra = ['/room']; this.relay = relay; this.roomSeen = false;
     this.conn = makeConn(relay, '/h', m => ({ f: this.cid, m })); this.conn.open = false;
     relay.start();
     this.startHeartbeat(); this.knock();
@@ -820,15 +826,17 @@ const NET = {
     if (this.conn && this.conn.open) return;
     const relay = this.relay, waited = Date.now() - this.knockStart;
     if (Date.now() > this.retryUntil) { this.status('Lost the host. Ask them to keep the game open, then tap Retry.', 'bad'); if (S) toast('Disconnected from host.'); return; }
-    if (relay.up()) relay.ok.forEach((ok, i) => { if (ok) relay.send(i, '/h', { f: this.cid, m: { t: 'knock' } }); });
+    if (relay.up()) relay.sendAll('/h', { f: this.cid, m: { t: 'knock' } });
     if (!this.everJoined && !S) {
       if (!relay.up() && waited > 9000) this.status("Can't reach the online service. Check your internet connection, then tap Retry.", 'bad');
-      else if (relay.up() && waited > 9000) this.status(`No open room ${this.code} found yet. Check the code - the host must keep the game open. Still trying…`, 'bad');
+      else if (relay.up() && waited > 9000 && this.roomSeen) this.status(`Room ${this.code} found, but the host isn't answering yet - they may have the game in the background. Ask them to open it. Still trying…`, '');
+      else if (relay.up() && waited > 9000) this.status(`No open room ${this.code} found yet. Check the code, and make sure the host has the game open on the newest version (the lobby says "Online v2"; reload the page or update the app). Still trying…`, 'bad');
     }
     this._knock = setTimeout(() => this.knock(), now ? 1500 : 2500);
   },
-  onRelayClient(msg, bi) {
+  onRelayClient(msg, bi, f, topic) {
     if (this.leaving || this.mode !== 'client') return;
+    if (msg.t === 'room') { if (!this.roomSeen) { this.roomSeen = true; if (!this.everJoined) this.status('Room ' + this.code + ' found - waiting for the host to answer…'); } return; }
     this.lastHost = Date.now(); this.retryUntil = Date.now() + 180000;
     if (msg.t === 'here' || msg.t === 'who') {
       if (this.conn.open && msg.t === 'here') return; // already talking to the host on another relay
@@ -856,8 +864,10 @@ const NET = {
   },
 };
 // Phones suspend sockets in the background (e.g. while the host shares the invite); reconnect as soon as the app is visible again.
-document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'visible' || !NET.relay) return; NET.relay.wake(); if (NET.mode === 'client') { if (NET.conn && NET.conn.open) NET.conn.send({ t: 'sync' }); else NET.knock(true); } });
-window.addEventListener('online', () => { if (NET.relay) NET.relay.wake(); });
+let hiddenAt = 0;
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') { hiddenAt = Date.now(); return; } if (!NET.relay) return; NET.relay.wake(hiddenAt && Date.now() - hiddenAt > 4000); hiddenAt = 0; if (NET.mode === 'client') { if (NET.conn && NET.conn.open) NET.conn.send({ t: 'sync' }); else NET.knock(true); } });
+window.addEventListener('online', () => { if (NET.relay) NET.relay.wake(true); });
+window.addEventListener('pageshow', e => { if (e.persisted && NET.relay) NET.relay.wake(true); });
 function log2(m) { if (S) { S.log.push(m); } toast(m); }
 function setupOnline() {
   const nm = () => (setup.seats[0] && setup.seats[0].name || '').trim() || 'Player';

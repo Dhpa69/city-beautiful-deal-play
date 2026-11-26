@@ -8,7 +8,7 @@
 <title>City Beautiful Deal</title>
 <link rel="icon" type="image/png" href="favicon.png">
 <link rel="apple-touch-icon" href="icon-180.png">
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=6">
 </head>
 <body>
 <div id="setup" class="screen">
@@ -39,6 +39,7 @@
     <div id="lobbySeats"></div>
     <p id="lobbyStatus" class="center muted"></p><button id="lobbyRetry" class="primary big hidden">Retry connection</button>
     <button id="lobbyStart" class="primary big">Start game</button>
+    <p class="center muted" style="font-size:11px;opacity:.7">Online v2 · relay connection (Wi-Fi or cellular). Everyone needs v2 - if a room is not found, have the host reload the page.</p>
     <p id="lobbyWait" class="center muted">The host starts the game when everyone is in.</p>
     <button id="lobbyLeave" class="ghost big">Leave room</button>
   </div>
@@ -73,9 +74,9 @@
 <div id="modal" class="overlay hidden"><div class="sheet" id="sheet"></div></div>
 <div id="pass" class="overlay solid hidden"><div class="pass-box"><div class="sun"></div><h2 id="passTitle"></h2><p id="passMsg"></p><button id="passBtn" class="primary big"></button></div></div>
 
-<script src="vendor/mqtt.min.js"></script>
-<script src="engine.js"></script>
-<script src="ai.js"></script>
-<script src="app.js"></script>
+<script src="vendor/mqtt.min.js?v=6"></script>
+<script src="engine.js?v=6"></script>
+<script src="ai.js?v=6"></script>
+<script src="app.js?v=6"></script>
 </body>
 </html>
