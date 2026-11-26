@@ -565,22 +565,92 @@ $('menuBtn').onclick = () => openModal(sh => {
   const r = el('button', 'Resume'); r.onclick = () => { closeModal(); loop(); };
   box.append(r, el('div', 'Move speed', 'sec'), sp, tipsB, q); sh.appendChild(box);
 });
-// ---------- online play: host-authoritative peer-to-peer (PeerJS public broker, no accounts) ----------
+// ---------- online play: host-authoritative, relayed over public MQTT-over-WebSocket brokers (no accounts, no keys) ----------
+// Every phone only makes outgoing secure WebSocket connections (wss://), so it works on cellular, hotel Wi-Fi and behind any NAT.
+// The host listens on several free public brokers at once; a joining phone uses whichever one answers first.
+// Messages are end-to-end encrypted with a key derived from the room code, and topics are hashed, so the brokers only see noise.
 const DECK = E.buildDeck();
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-const PEER_OPTS = { debug: (window.__cbdDebug || 1), config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }, { urls: 'stun:global.stun.twilio.com:3478' }] } };
 const CLIENT_KEY = 'cbd-online-client';
 const rid = n => Array.from({ length: n }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join('');
+const BROKERS = window.__cbdBrokers || [
+  { name: 'shiftr', url: 'wss://public.cloud.shiftr.io', opts: { username: 'public', password: 'public' } },
+  { name: 'emqx', url: 'wss://broker.emqx.io:8084/mqtt' },
+  { name: 'hivemq', url: 'wss://broker.hivemq.com:8884/mqtt' },
+];
+const TXT = new TextEncoder(), UNTXT = new TextDecoder();
+const hex = buf => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+async function roomCrypto(code) {
+  const subtle = window.crypto && window.crypto.subtle;
+  if (!subtle) return { topic: 'cbdeal/v2/p/' + code, key: null };
+  const topic = 'cbdeal/v2/' + hex(await subtle.digest('SHA-256', TXT.encode('cbd-topic:' + code))).slice(0, 24);
+  const base = await subtle.importKey('raw', TXT.encode('cbd-room:' + code), 'PBKDF2', false, ['deriveKey']);
+  const key = await subtle.deriveKey({ name: 'PBKDF2', salt: TXT.encode('city-beautiful-deal-v2'), iterations: 20000, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 128 }, false, ['encrypt', 'decrypt']);
+  return { topic, key };
+}
+async function seal(key, obj) {
+  const data = TXT.encode(JSON.stringify(obj));
+  if (!key) { const out = new Uint8Array(data.length + 1); out[0] = 80; out.set(data, 1); return out; }
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, data));
+  const out = new Uint8Array(13 + ct.length); out[0] = 69; out.set(iv, 1); out.set(ct, 13); return out;
+}
+async function unseal(key, buf) {
+  const u = new Uint8Array(buf);
+  if (u[0] === 80) return JSON.parse(UNTXT.decode(u.subarray(1)));
+  if (u[0] !== 69 || !key) return null;
+  return JSON.parse(UNTXT.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u.subarray(1, 13) }, key, u.subarray(13))));
+}
+// A Relay connects to every broker, subscribes to one inbox topic, and delivers decrypted messages in order.
+class Relay {
+  constructor(code, inbox, onMsg, onStatus) { this.code = code; this.inbox = inbox; this.onMsg = onMsg; this.onStatus = onStatus || (() => {}); this.clients = []; this.ok = []; this.closed = false; this.q = Promise.resolve(); this.rq = Promise.resolve(); }
+  async start() {
+    const rc = await roomCrypto(this.code); this.topic = rc.topic; this.key = rc.key;
+    if (this.closed) return;
+    if (!window.mqtt) { this.onStatus('nolib'); return; }
+    BROKERS.forEach((b, i) => {
+      const will = this.will ? { topic: this.topic + '/h', payload: 'G:' + this.will, qos: 0, retain: false } : undefined;
+      const c = window.mqtt.connect(b.url, Object.assign({ clientId: 'cbd' + rid(10).toLowerCase(), keepalive: 20, reconnectPeriod: 2500, connectTimeout: 9000, clean: true, will, protocolVersion: 4 }, b.opts || {}));
+      this.clients[i] = c; this.ok[i] = false;
+      c.on('connect', () => { c.subscribe(this.topic + this.inbox, { qos: 1 }, err => { this.ok[i] = !err; this.onStatus('change', i); }); });
+      c.on('close', () => { if (this.ok[i]) { this.ok[i] = false; this.onStatus('change', i); } });
+      c.on('offline', () => { if (this.ok[i]) { this.ok[i] = false; this.onStatus('change', i); } });
+      c.on('error', () => {});
+      c.on('message', (t, payload) => {
+        const raw = new Uint8Array(payload);
+        if (raw[0] === 71 && raw[1] === 58) { const cid = UNTXT.decode(raw.subarray(2)); this.rq = this.rq.then(() => this.onMsg({ t: 'gone' }, i, cid)); return; }
+        this.rq = this.rq.then(() => unseal(this.key, raw)).then(m => { if (m && !this.closed) this.onMsg(m.m || m, i, m.f); }).catch(() => {});
+      });
+    });
+  }
+  up() { return this.ok.filter(Boolean).length; }
+  send(i, sub, obj) {
+    const c = this.clients[i]; if (!c || this.closed) return false;
+    this.q = this.q.then(() => seal(this.key, obj)).then(p => { if (c.connected) c.publish(this.topic + sub, p, { qos: 1 }); }).catch(() => {});
+    return !!this.ok[i];
+  }
+  wake() { this.clients.forEach(c => { try { if (!c.connected && !c.reconnecting) c.reconnect(); } catch (e) {} }); }
+  end() { this.closed = true; this.clients.forEach(c => { try { c.end(true); } catch (e) {} }); this.clients = []; }
+}
+// A virtual connection to one remote phone (host side) or to the host (phone side).
+function makeConn(relay, sub, wrap) {
+  return { open: true, broker: -1, send(msg) { if (this.open && this.broker >= 0) relay.send(this.broker, sub, wrap ? wrap(msg) : msg); }, close() { this.open = false; } };
+}
 const NET = {
-  mode: 'local', peer: null, code: null, grace: 30000, room: null, conns: {}, conn: null, seat: null, token: null, name: '', leaving: false, hb: null, lastHost: 0, retryUntil: 0,
+  mode: 'local', relay: null, code: null, grace: 30000, room: null, conns: {}, conn: null, seat: null, token: null, name: '', leaving: false, hb: null, lastHost: 0, retryUntil: 0, cid: null, aid: 0, pendingAct: null,
   // ----- shared -----
-  status(msg) { $('lobbyStatus').textContent = msg || ''; },
+  status(msg, kind) {
+    $('lobbyStatus').textContent = msg || ''; $('lobbyStatus').className = 'center ' + (kind === 'bad' ? 'bad' : kind === 'good' ? 'good' : 'muted');
+    $('lobbyRetry').classList.toggle('hidden', kind !== 'bad');
+    const pill = $('netPill'); if (pill) { pill.classList.toggle('hidden', this.mode === 'local'); pill.className = 'netpill ' + (kind || '') + (this.mode === 'local' ? ' hidden' : ''); pill.textContent = kind === 'bad' ? '⚠ Offline' : kind === 'good' ? '● Online' : '◌ Connecting'; }
+  },
   leave() {
-    this.leaving = true; clearInterval(this.hb);
+    this.leaving = true; clearInterval(this.hb); clearTimeout(this._knock); clearTimeout(this._rt);
     try { if (this.mode === 'client' && this.conn && this.conn.open) this.conn.send({ t: 'bye' }); } catch (e) {}
-    try { this.peer && this.peer.destroy(); } catch (e) {}
+    const r = this.relay; if (r) setTimeout(() => r.end(), 300);
     if (this.mode === 'client') localStorage.removeItem(CLIENT_KEY);
-    this.mode = 'local'; this.peer = null; this.conn = null; this.conns = {}; this.room = null; this.code = null;
+    this.mode = 'local'; this.relay = null; this.conn = null; this.conns = {}; this.room = null; this.code = null; this.pendingAct = null;
+    const pill = $('netPill'); if (pill) pill.classList.add('hidden');
   },
   refreshSetup() {
     const c = JSON.parse(localStorage.getItem(CLIENT_KEY) || 'null');
@@ -610,36 +680,40 @@ const NET = {
     $('lobbySeats').innerHTML = (seats || []).slice(0, total).map((s, i) => `<div class="lseat" data-i="${i}">${teams ? `<button class="tbtn" data-i="${i}" style="background:${TEAM_HEX[s.team || 0]}">${E.TEAM_NAMES[s.team || 0].replace('Team ', '')}</button>` : ''}<span class="dot ${s.kind === 'open' ? 'open' : s.kind === 'remote' && !s.connected ? 'off' : 'on'}"></span><b>${esc(s.kind === 'open' ? 'Open seat' : s.name)}</b><span>${s.kind === 'host' ? 'Host' : s.kind === 'remote' ? (s.connected ? 'Joined' : 'Reconnecting…') : s.kind === 'ai' ? 'Computer' : 'Computer fills this if nobody joins'}${this.mode === 'client' && i === this.seat ? ' · you' : ''}</span></div>`).join('') + (teams ? `<p class="center muted" style="font-size:12px">${host ? 'Tap a team badge to switch a seat. ' : ''}Team mode: 2 vs 2, a team needs 5 sets.</p>` : '');
     if (host && teams) $('lobbySeats').querySelectorAll('.tbtn').forEach(b => b.onclick = () => { const s = this.room.seats[+b.dataset.i]; s.team = (s.team || 0) ? 0 : 1; this.broadcastLobby(); });
   },
+  retry() { if (this.mode === 'host' && this.room) { const r = this.room, code = this.code; this.relay && this.relay.end(); this.relay = null; this.openRelay(code, true); } else if (this.mode === 'client' || localStorage.getItem(CLIENT_KEY)) { const c = JSON.parse(localStorage.getItem(CLIENT_KEY) || 'null'); if (c) this.join(c.code, c.name); } },
   // ----- host -----
   host(name, total) {
     this.leave(); this.leaving = false; this.mode = 'host'; this.name = name;
     this.room = { total, teams: false, seats: [{ kind: 'host', name, connected: true, team: 0 }].concat([1, 2, 3].map(i => ({ kind: 'open', name: '', team: i % 2 }))), started: false };
-    this.openPeer(rid(5), 0);
+    this.code = rid(5); this.showLobby(); this.openRelay(this.code, false);
   },
   roomSave() { return { code: this.code, total: this.room.total, teams: this.room.teams, seats: this.room.seats.map(s => ({ kind: s.kind, name: s.name, token: s.token, team: s.team })), started: this.room.started }; },
   resumeHost(r) {
     this.leave(); this.leaving = false; this.mode = 'host'; this.room = { total: r.total, teams: r.teams, seats: r.seats.map(s => Object.assign({}, s, { connected: s.kind === 'host' })), started: true };
     S.players.forEach(p => { if (p.remote) p.away = p.away || Date.now(); });
-    this.openPeer(r.code, 0, true); showGame();
+    this.code = r.code; this.openRelay(r.code, true); showGame();
   },
-  openPeer(code, tries, resuming) {
-    this.code = code; if (!resuming) { this.showLobby(); this.status('Opening room…'); }
-    const peer = new Peer('cbd-' + code, PEER_OPTS); this.peer = peer;
-    peer.on('open', () => { this.status('Room open. Share the invite, then tap Start.'); if (!resuming) this.renderLobby(); else toast('Room ' + code + ' reopened - players can rejoin.'); this.startHeartbeat(); });
-    peer.on('connection', conn => this.onConn(conn));
-    peer.on('disconnected', () => { if (!this.leaving && this.peer === peer) setTimeout(() => { try { peer.reconnect(); } catch (e) {} }, 2000); });
-    peer.on('error', err => {
-      if (this.peer !== peer || this.leaving) return;
-      if (err.type === 'unavailable-id') { try { peer.destroy(); } catch (e) {} if (resuming && tries < 20) return setTimeout(() => this.openPeer(code, tries + 1, true), 3000); return this.openPeer(rid(5), tries + 1, resuming); }
-      if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error' || err.type === 'socket-closed') { this.status('Connection problem - retrying…'); return; }
-      if (err.type === 'browser-incompatible') { this.status('This device does not support online play.'); return; }
-      console.warn('peer error', err.type, err);
+  openRelay(code, resuming) {
+    this.status('Opening room…'); this.conns = {}; this.hs = rid(6);
+    const started = Date.now(); let announced = false;
+    const relay = new Relay(code, '/h', (msg, bi, cid) => this.onRelayHost(msg, bi, cid), () => {
+      if (this.relay !== relay) return;
+      const up = relay.up();
+      if (up) { this.status(`Room open (${up} of ${BROKERS.length} relays). Share the invite, then tap Start.`, 'good'); if (!announced) { announced = true; if (resuming) toast('Room ' + code + ' reopened - players can rejoin.'); } }
+      else this.status(Date.now() - started > 9000 ? "Can't reach the online service. Check your internet connection, then tap Retry." : 'Opening room…', Date.now() - started > 9000 ? 'bad' : '');
     });
+    this.relay = relay; relay.start();
+    clearTimeout(this._chk); this._chk = setTimeout(() => { if (this.relay === relay && !relay.up()) this.status("Can't reach the online service. Check your internet connection, then tap Retry.", 'bad'); }, 10000);
+    this.startHeartbeat();
   },
-  onConn(conn) {
-    conn.on('data', msg => this.onHostMsg(conn, msg));
-    conn.on('close', () => this.dropConn(conn));
-    conn.on('error', () => this.dropConn(conn));
+  onRelayHost(msg, bi, cid) {
+    if (!cid || typeof cid !== 'string' || cid.length > 40) return;
+    let conn = this.conns[cid];
+    if (msg.t === 'gone') { if (conn && conn.broker === bi) { conn.close(); this.dropConn(conn); delete this.conns[cid]; } return; }
+    if (!conn || !conn.open) { conn = makeConn(this.relay, '/c/' + cid); conn.cid = cid; this.conns[cid] = conn; }
+    conn.broker = bi; // reply on whichever relay this phone used last
+    if (msg.t === 'knock') return conn.send({ t: 'here', code: this.code });
+    this.onHostMsg(conn, msg);
   },
   seatOfConn(conn) { return this.room.seats.findIndex(s => s.conn === conn); },
   dropConn(conn) {
@@ -650,31 +724,35 @@ const NET = {
   },
   onHostMsg(conn, msg) {
     if (!msg || typeof msg !== 'object') return;
-    const room = this.room; let i = this.seatOfConn(conn);
+    const room = this.room; if (!room) return; let i = this.seatOfConn(conn);
     if (i >= 0) room.seats[i].lastSeen = Date.now();
     if (msg.t === 'hello') {
       const token = String(msg.token || '').slice(0, 40), name = String(msg.name || 'Player').trim().slice(0, 16) || 'Player';
       i = room.seats.findIndex(s => s.kind === 'remote' && s.token === token);
       if (i < 0) {
-        if (room.started) { conn.send({ t: 'fatal', msg: 'That game has already started.' }); return setTimeout(() => conn.close(), 500); }
+        if (room.started) return conn.send({ t: 'fatal', msg: 'That game has already started.' });
         i = room.seats.findIndex((s, k) => k < room.total && s.kind === 'open');
-        if (i < 0) { conn.send({ t: 'fatal', msg: 'That room is full.' }); return setTimeout(() => conn.close(), 500); }
-        room.seats[i] = { kind: 'remote', name, token, team: room.seats[i].team };
+        if (i < 0) return conn.send({ t: 'fatal', msg: 'That room is full.' });
+        room.seats[i] = { kind: 'remote', name, token, team: room.seats[i].team, lastAid: 0 };
       }
-      const s = room.seats[i]; if (s.conn && s.conn !== conn) { try { s.conn.close(); } catch (e) {} }
+      const s = room.seats[i]; if (s.conn && s.conn !== conn) { s.conn.close(); }
       s.conn = conn; s.connected = true; s.lastSeen = Date.now();
-      conn.send({ t: 'welcome', seat: i, code: this.code });
-      if (room.started && S) { if (S.players[i].away) { S.players[i].away = null; log2(S.players[i].name + ' is back.'); } loop(); }
+      conn.send({ t: 'welcome', seat: i, code: this.code, lastAid: s.lastAid || 0 });
+      if (room.started && S) { if (S.players[i].away) { S.players[i].away = null; log2(S.players[i].name + ' is back.'); } this.sendState(i); loop(); }
       else this.broadcastLobby();
       return;
     }
-    if (i < 0) return;
+    if (i < 0) { if (msg.t !== 'bye') conn.send({ t: 'who' }); return; } // unknown phone (e.g. host page reloaded): ask it to say hello again
     if (msg.t === 'act') {
-      if (!S || S.winner != null || E.actorNow(S) !== i) { conn.send({ t: 'error', msg: 'Not your move right now.' }); return this.sendState(i); }
+      const s = room.seats[i];
+      if (msg.aid && msg.aid <= (s.lastAid || 0)) return this.sendState(i); // duplicate resend - already applied
+      if (!S || S.winner != null || E.actorNow(S) !== i) { conn.send({ t: 'error', msg: 'Not your move right now.', aid: msg.aid }); s.lastAid = msg.aid || s.lastAid; return this.sendState(i); }
       if (!playing) shown = snapshot();
-      try { E.apply(S, msg.a); } catch (e) { shown = null; conn.send({ t: 'error', msg: e.message }); return this.sendState(i); }
+      try { E.apply(S, msg.a); s.lastAid = msg.aid || s.lastAid; } catch (e) { shown = null; s.lastAid = msg.aid || s.lastAid; conn.send({ t: 'error', msg: e.message, aid: msg.aid }); return this.sendState(i); }
       loop();
-    } else if (msg.t === 'bye') { this.dropConn(conn); }
+    } else if (msg.t === 'pong') { if (room.started && S && (msg.hs !== this.hs || msg.ver < this.ver)) this.sendState(i); }
+    else if (msg.t === 'sync') { if (room.started && S) this.sendState(i); else this.broadcastLobby(); }
+    else if (msg.t === 'bye') { conn.close(); this.dropConn(conn); delete this.conns[conn.cid]; }
   },
   setTeams(on) { if (on && this.room.seats.filter(s => s.kind !== 'open').length > 4) return; this.room.teams = on; if (on) this.room.total = 4; this.broadcastLobby(); },
   setTotal(n) { if (this.room.teams && n !== 4) return toast('Team mode is 4 players (2 vs 2).'); const joined = this.room.seats.filter(s => s.kind !== 'open').length; if (n < joined) return toast('Already ' + joined + ' players joined.'); this.room.total = n; this.broadcastLobby(); },
@@ -698,69 +776,88 @@ const NET = {
     loop();
   },
   viewFor(seat) {
-    const v = Object.assign({}, S); delete v.cards; v.rs = 0; v.deck = S.deck.map(() => -1);
+    const v = Object.assign({}, S); delete v.cards; v.rs = 0; v.deck = S.deck.map(() => -1); v.log = S.log.slice(-60);
     v.players = S.players.map(p => p.id === seat ? p : Object.assign({}, p, { hand: p.hand.map(() => -1) }));
     return v;
   },
-  sendState(i) { const s = this.room.seats[i]; if (s && s.conn && s.conn.open) s.conn.send({ t: 'state', seat: i, ver: this.ver, S: this.viewFor(i) }); },
+  sendState(i) { const s = this.room.seats[i]; if (s && s.conn && s.conn.open) s.conn.send({ t: 'state', seat: i, ver: this.ver, hs: this.hs, lastAid: s.lastAid || 0, S: this.viewFor(i) }); },
   ver: 0,
   broadcastState() { if (!this.room) return; this.ver++; this.room.seats.forEach((s, i) => { if (s.kind === 'remote') this.sendState(i); }); },
   startHeartbeat() {
     clearInterval(this.hb);
     this.hb = setInterval(() => {
-      if (this.mode === 'host' && this.room) this.room.seats.forEach(s => { if (s.conn) { if (s.conn.open) s.conn.send({ t: 'ping' }); if (Date.now() - (s.lastSeen || 0) > 20000) { const c = s.conn; try { c.close(); } catch (e) {} this.dropConn(c); } } });
-      if (this.mode === 'client') { if (this.conn && this.conn.open) this.conn.send({ t: 'pong' }); if (this.conn && Date.now() - this.lastHost > 15000) { const c = this.conn; this.conn = null; try { c.close(); } catch (e) {} this.reconnect(); } }
-    }, 4000);
+      if (this.mode === 'host' && this.room) this.room.seats.forEach(s => { if (s.conn) { if (s.conn.open) s.conn.send({ t: 'ping' }); if (Date.now() - (s.lastSeen || 0) > 25000) { const c = s.conn; c.close(); this.dropConn(c); } } });
+      if (this.mode === 'client') {
+        if (this.conn && this.conn.open) this.conn.send({ t: 'pong', ver: this.ver, hs: this.hs });
+        if (this.conn && this.conn.open && Date.now() - this.lastHost > 14000) { this.conn.open = false; this.status('Lost contact with the host - reconnecting…', ''); if (S) toast('Reconnecting to host…'); this.knock(); }
+        if (this.pendingAct && Date.now() - this.pendingAct.at > 5000 && this.conn && this.conn.open) { this.pendingAct.at = Date.now(); this.conn.send(this.pendingAct.msg); }
+      }
+    }, 3000);
   },
   // ----- client -----
-  send(msg) { if (this.conn && this.conn.open) this.conn.send(msg); else { toast('Not connected - reconnecting…'); this.reconnect(); } },
+  send(msg) {
+    if (msg.t === 'act') { msg.aid = ++this.aid; this.pendingAct = { msg, at: Date.now() }; }
+    if (this.conn && this.conn.open) this.conn.send(msg); else { toast('Not connected - reconnecting…'); this.knock(); }
+  },
   join(code, name) {
     code = String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); if (code.length < 4) return toast('Enter the room code from the invite.');
-    this.leave(); this.leaving = false; this.mode = 'client'; this.code = code; this.name = name;
+    this.leave(); this.leaving = false; this.mode = 'client'; this.code = code; this.name = name; this.everJoined = false; this.aid = 0; this.pendingAct = null;
     const saved = JSON.parse(localStorage.getItem(CLIENT_KEY) || 'null');
     this.token = saved && saved.code === code ? saved.token : rid(12);
+    this.cid = rid(12).toLowerCase();
     localStorage.setItem(CLIENT_KEY, JSON.stringify({ code, token: this.token, name }));
     this.showLobby(); this.renderLobby([], 0); this.status('Connecting to room ' + code + '…');
-    this.retryUntil = Date.now() + 180000;
-    const peer = new Peer(PEER_OPTS); this.peer = peer;
-    peer.on('open', () => this.connect());
-    peer.on('disconnected', () => { if (!this.leaving && this.peer === peer) setTimeout(() => { try { peer.reconnect(); } catch (e) {} }, 2000); });
-    peer.on('error', err => {
-      if (this.peer !== peer || this.leaving) return;
-      if (err.type === 'peer-unavailable') { if (!S && !this.everJoined) { this.status('No open room ' + code + ' found. Check the code; the host must keep the app open.'); } return this.reconnect(); }
-      if (err.type === 'browser-incompatible') return this.status('This device does not support online play.');
-      this.reconnect();
-    });
-    this.startHeartbeat();
+    this.retryUntil = Date.now() + 180000; this.knockStart = Date.now();
+    const relay = new Relay(code, '/c/' + this.cid, (msg, bi) => this.onRelayClient(msg, bi), () => { if (this.relay !== relay || !relay.up()) return; if (!this.conn || !this.conn.open) this.knock(true); else this.conn.send({ t: 'sync' }); });
+    relay.will = this.cid; this.relay = relay;
+    this.conn = makeConn(relay, '/h', m => ({ f: this.cid, m })); this.conn.open = false;
+    relay.start();
+    this.startHeartbeat(); this.knock();
   },
-  connect() {
-    if (this.leaving || !this.peer || this.peer.destroyed) return;
-    const conn = this.peer.connect('cbd-' + this.code, { reliable: true, serialization: 'json' }); this.conn = conn;
-    const t = setTimeout(() => { if (this.conn === conn && !conn.open) { try { conn.close(); } catch (e) {} this.conn = null; this.reconnect(); } }, 12000);
-    conn.on('open', () => { clearTimeout(t); this.lastHost = Date.now(); conn.send({ t: 'hello', name: this.name, token: this.token }); });
-    conn.on('data', msg => this.onClientMsg(msg));
-    conn.on('close', () => { if (this.conn === conn) { this.conn = null; this.reconnect(); } });
-    conn.on('error', () => { if (this.conn === conn) { this.conn = null; this.reconnect(); } });
+  knock(now) {
+    if (this.leaving || this.mode !== 'client' || !this.relay) return;
+    clearTimeout(this._knock);
+    if (this.conn && this.conn.open) return;
+    const relay = this.relay, waited = Date.now() - this.knockStart;
+    if (Date.now() > this.retryUntil) { this.status('Lost the host. Ask them to keep the game open, then tap Retry.', 'bad'); if (S) toast('Disconnected from host.'); return; }
+    if (relay.up()) relay.ok.forEach((ok, i) => { if (ok) relay.send(i, '/h', { f: this.cid, m: { t: 'knock' } }); });
+    if (!this.everJoined && !S) {
+      if (!relay.up() && waited > 9000) this.status("Can't reach the online service. Check your internet connection, then tap Retry.", 'bad');
+      else if (relay.up() && waited > 9000) this.status(`No open room ${this.code} found yet. Check the code - the host must keep the game open. Still trying…`, 'bad');
+    }
+    this._knock = setTimeout(() => this.knock(), now ? 1500 : 2500);
   },
-  reconnect() {
-    if (this.leaving || this.mode !== 'client' || this._rt) return;
-    if (Date.now() > this.retryUntil) { this.status('Lost the host. Ask them to keep the app open, then rejoin.'); toast('Disconnected from host.'); return; }
-    if (S) toast('Reconnecting to host…'); else if (this.everJoined) this.status('Reconnecting…');
-    this._rt = setTimeout(() => { this._rt = null; if (this.peer && this.peer.disconnected && !this.peer.destroyed) { try { this.peer.reconnect(); } catch (e) {} } if (this.peer && this.peer.open) this.connect(); else this.reconnect(); }, 3000);
+  onRelayClient(msg, bi) {
+    if (this.leaving || this.mode !== 'client') return;
+    this.lastHost = Date.now(); this.retryUntil = Date.now() + 180000;
+    if (msg.t === 'here' || msg.t === 'who') {
+      if (this.conn.open && msg.t === 'here') return; // already talking to the host on another relay
+      this.conn.broker = bi; this.conn.open = true; clearTimeout(this._knock);
+      this.conn.send({ t: 'hello', name: this.name, token: this.token });
+      if (this.everJoined) this.status('Reconnected.', 'good');
+      return;
+    }
+    if (!this.conn.open) { this.conn.open = true; this.conn.broker = bi; }
+    this.onClientMsg(msg);
   },
   onClientMsg(msg) {
-    if (!msg) return; this.lastHost = Date.now(); this.retryUntil = Date.now() + 180000;
+    if (!msg) return;
     switch (msg.t) {
-      case 'welcome': this.seat = msg.seat; this.everJoined = true; this.status('Joined! Waiting for the host to start.'); break;
+      case 'welcome': this.seat = msg.seat; this.everJoined = true; if (msg.lastAid > this.aid) this.aid = msg.lastAid; this.status(S ? 'Connected.' : 'Joined! Waiting for the host to start.', 'good'); if (this.pendingAct && this.pendingAct.msg.aid > (msg.lastAid || 0)) this.conn.send(this.pendingAct.msg); else this.pendingAct = null; if (S) this.conn.send({ t: 'sync' }); break;
       case 'lobby': this.seat = msg.seat; this._teams = !!msg.teams; if (!S) { this.showLobby(); this.renderLobby(msg.seats, msg.total); } break;
-      case 'state': { this.seat = msg.seat; this.ver = msg.ver; const prev = S; if (!playing && prev) shown = prev; S = msg.S; S.cards = DECK; viewer = msg.seat; if (!prev) lastSeq = S.evSeq || 0;
+      case 'state': { if (this.pendingAct && (msg.lastAid || 0) >= this.pendingAct.msg.aid) this.pendingAct = null; if (msg.lastAid > this.aid) this.aid = msg.lastAid;
+        if (S && msg.hs === this.hs && msg.ver < this.ver) break; this.hs = msg.hs;
+        this.seat = msg.seat; this.ver = msg.ver; const prev = S; if (!playing && prev) shown = prev; S = msg.S; S.cards = DECK; viewer = msg.seat; if (!prev) lastSeq = S.evSeq || 0;
         if ($('game').classList.contains('hidden')) { $('lobby').classList.add('hidden'); $('setup').classList.add('hidden'); $('game').classList.remove('hidden'); }
         loop(); break; }
-      case 'error': toast(msg.msg); break;
+      case 'error': if (this.pendingAct && msg.aid === this.pendingAct.msg.aid) this.pendingAct = null; toast(msg.msg); break;
       case 'fatal': toast(msg.msg); localStorage.removeItem(CLIENT_KEY); this.leave(); backToSetup(); break;
     }
   },
 };
+// Phones suspend sockets in the background (e.g. while the host shares the invite); reconnect as soon as the app is visible again.
+document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'visible' || !NET.relay) return; NET.relay.wake(); if (NET.mode === 'client') { if (NET.conn && NET.conn.open) NET.conn.send({ t: 'sync' }); else NET.knock(true); } });
+window.addEventListener('online', () => { if (NET.relay) NET.relay.wake(); });
 function log2(m) { if (S) { S.log.push(m); } toast(m); }
 function setupOnline() {
   const nm = () => (setup.seats[0] && setup.seats[0].name || '').trim() || 'Player';
@@ -779,6 +876,7 @@ function setupOnline() {
   $('lobbyStart').onclick = () => NET.start();
   $('lobbyInvite').onclick = () => NET.shareInvite();
   $('lobbyLeave').onclick = () => { NET.leave(); backToSetup(); };
+  $('lobbyRetry').onclick = () => NET.retry();
   NET.refreshSetup();
   // deep link: citybeautiful://join/CODE
   const handleUrl = url => { const m = /join[\/=]([A-Za-z0-9]{4,8})/.exec(url || ''); if (m) openJoin(m[1].toUpperCase()); };

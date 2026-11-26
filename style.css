@@ -180,3 +180,5 @@ header .title{font-weight:900;color:var(--accent2);white-space:nowrap;font-size:
 .speedseg{display:flex;flex-direction:row!important}.speedseg button{flex:1}
 @media(min-width:900px){#board{padding:12px 24px}.card{--w:104px}.card.lg{--w:170px}#hand{justify-content:center}}
 .cbar.rainbow{background:linear-gradient(90deg,#8b4513,#7fd3f7,#e65ea8,#f7941d,#e23b3b,#f5d000,#2fa65a,#1e4fa3)!important}.tbadge{font-size:10px;font-weight:800;padding:1px 6px;border-radius:6px;color:#1d1300}
+#lobbyStatus.bad{color:#ffb4a8;font-weight:700}#lobbyStatus.good{color:#b9f6ca;font-weight:700}
+.netpill{font-size:11px;font-weight:800;padding:3px 8px;border-radius:10px;background:#ffffff1a;white-space:nowrap}.netpill.good{color:#b9f6ca}.netpill.bad{background:#e23b3b88;color:#fff}

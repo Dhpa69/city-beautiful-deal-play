@@ -37,7 +37,7 @@
     <div class="row" id="lobbyCount"><label>Players</label><div class="seg"><button data-n="2">2</button><button data-n="3">3</button><button data-n="4">4</button></div></div>
     <div class="row" id="lobbyTeams"><label>Teams</label><div class="seg"><button data-t="0" class="on">Off</button><button data-t="1">2 vs 2</button></div></div>
     <div id="lobbySeats"></div>
-    <p id="lobbyStatus" class="center muted"></p>
+    <p id="lobbyStatus" class="center muted"></p><button id="lobbyRetry" class="primary big hidden">Retry connection</button>
     <button id="lobbyStart" class="primary big">Start game</button>
     <p id="lobbyWait" class="center muted">The host starts the game when everyone is in.</p>
     <button id="lobbyLeave" class="ghost big">Leave room</button>
@@ -47,7 +47,7 @@
 <div id="game" class="screen hidden">
   <header>
     <div class="title">City Beautiful <span>Deal</span></div>
-    <div id="turnPill"></div>
+    <div id="turnPill"></div><span id="netPill" class="netpill hidden"></span>
     <div class="hbtns"><button id="speedBtn" class="icon" title="Move speed"></button><button id="logBtn" class="icon" title="Game log">Log</button><button id="helpBtn" class="icon" title="Rules">?</button><button id="menuBtn" class="icon" title="Menu">☰</button></div>
   </header>
   <div id="feed" title="Recent moves - tap for the full log"></div>
@@ -73,7 +73,7 @@
 <div id="modal" class="overlay hidden"><div class="sheet" id="sheet"></div></div>
 <div id="pass" class="overlay solid hidden"><div class="pass-box"><div class="sun"></div><h2 id="passTitle"></h2><p id="passMsg"></p><button id="passBtn" class="primary big"></button></div></div>
 
-<script src="vendor/peerjs.min.js"></script>
+<script src="vendor/mqtt.min.js"></script>
 <script src="engine.js"></script>
 <script src="ai.js"></script>
 <script src="app.js"></script>
